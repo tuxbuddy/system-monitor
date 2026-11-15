@@ -1471,8 +1471,7 @@ impl CpuManagerApp {
         painter.rect_filled(rect, 4.0, theme::EXTREME);
         let gap = if n > 24 { 1.0 } else { 2.0 };
         let bw = ((rect.width() - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
-        for i in 0..n {
-            let v = self.usage.core_percent[i];
+        for (i, &v) in self.usage.core_percent.iter().enumerate() {
             let f = (v / 100.0).clamp(0.0, 1.0);
             let bh = (rect.height() * f).max(2.0);
             let x = rect.left() + i as f32 * (bw + gap);
