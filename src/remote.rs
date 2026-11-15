@@ -266,23 +266,20 @@ fn ssh_sh(target: &str, script: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// 从远端 `cat /proc/self/cgroup; id -u` 的输出里取 user@uid.service 委派根。
-pub fn parse_remote_base(text: &str) -> Option<String> {
-    let uid: u32 = text.lines().rev().find_map(|l| l.trim().parse().ok())?;
-    let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let marker = format!("user@{uid}.service");
-    let mut acc: Vec<&str> = Vec::new();
-    for seg in path.split('/').filter(|x| !x.is_empty()) {
-        acc.push(seg);
-        if seg == marker {
-            return Some(format!("/sys/fs/cgroup/{}", acc.join("/")));
-        }
-    }
-    None
+/// 用户 systemd 管理器（委派根）目录：user-<uid>.slice/user@<uid>.service。
+pub fn user_service_path(uid: u32) -> String {
+    format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service")
 }
 
+/// 远端可写的委派根。注意：SSH 会话本身在 `session-*.scope`，并不在 `user@uid.service`
+/// 内，所以必须按 SSH 用户的 uid 推算 user@uid.service 并校验存在且可写。
 pub fn cg_base(target: &str) -> Option<String> {
-    parse_remote_base(&ssh_sh(target, "cat /proc/self/cgroup; id -u")?)
+    let uid: u32 = ssh_sh(target, "id -u")?.trim().parse().ok()?;
+    let base = user_service_path(uid);
+    let ok = ssh_sh(target, &format!("[ -d '{base}' ] && [ -w '{base}' ] && echo OK"))
+        .map(|s| s.contains("OK"))
+        .unwrap_or(false);
+    ok.then_some(base)
 }
 
 /// 建并准备容器 cm-sched（+cpu +pids）。
@@ -427,13 +424,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_base_parse() {
-        let text = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/x.scope\n1000\n";
+    fn user_service_path_shape() {
         assert_eq!(
-            parse_remote_base(text),
-            Some("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service".to_string())
+            user_service_path(0),
+            "/sys/fs/cgroup/user.slice/user-0.slice/user@0.service"
         );
-        assert_eq!(parse_remote_base("0::/user.slice/session-3.scope\n1000\n"), None);
+        assert_eq!(
+            user_service_path(1000),
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+        );
     }
 
     #[test]
