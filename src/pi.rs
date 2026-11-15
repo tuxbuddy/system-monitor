@@ -449,7 +449,20 @@ mod tests {
 
     #[test]
     fn read_pi_stats_smoke() {
-        // Pi 500 真机冒烟：温度/频率/功耗/节流均应可得（与 actions 集成测试同属环境相关）
+        // 树莓派真机冒烟：温度/频率/功耗/节流均应可得。
+        // CI 等非树莓派环境没有 vcgencmd，只验证函数能安全返回。
+        let pf = crate::platform::platform();
+        let has_vcgencmd = pf.has_vcgencmd
+            && std::process::Command::new(&pf.vcgencmd_bin)
+                .arg("version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if !has_vcgencmd {
+            let s = read_pi_stats();
+            assert!(s.rails.is_empty());
+            return;
+        }
         let s = read_pi_stats();
         assert!(s.temp_c.is_some());
         assert!(s.freq_ghz.is_some());
