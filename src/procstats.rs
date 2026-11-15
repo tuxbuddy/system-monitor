@@ -463,6 +463,30 @@ pub fn read_filesystems() -> Vec<FsUsage> {
     out
 }
 
+/// 解析 `df -P -k` 输出（远端文件系统）；只保留以 /dev/ 开头真实块设备。
+pub fn parse_df(text: &str) -> Vec<FsUsage> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 6 || !f[0].starts_with("/dev/") {
+            continue;
+        }
+        let (Ok(total_kb), Ok(avail_kb)) = (f[1].parse::<u64>(), f[3].parse::<u64>()) else {
+            continue;
+        };
+        if total_kb == 0 {
+            continue;
+        }
+        out.push(FsUsage {
+            source: f[0].to_string(),
+            mount: f[5..].join(" "),
+            total_kb,
+            avail_kb,
+        });
+    }
+    out
+}
+
 /// 解析 /proc/<pid>/stat 行。comm 可含空格/括号，用首个 '(' 与最后一个 ')' 定位。
 pub fn parse_proc_stat(line: &str) -> Option<ProcSnapshot> {
     let open = line.find('(')?;
@@ -1139,6 +1163,22 @@ mod tests {
         let text = "rchar: 100\nwchar: 200\nread_bytes: 4096\nwrite_bytes: 8192\n";
         assert_eq!(parse_proc_io(text), (4096, 8192));
         assert_eq!(parse_proc_io("garbage"), (0, 0));
+    }
+
+    #[test]
+    fn parse_df_filters_pseudo_fs() {
+        let text = "Filesystem     1024-blocks     Used Available Capacity Mounted on\n\
+/dev/nvme0n1p2      491240   300000    170000      64% /\n\
+/dev/nvme0n1p1        1000      100       900      10% /boot/efi\n\
+tmpfs               1000000        1    999999       1% /run\n\
+/dev/sda1          976762584 1000000 900000000       1% /mnt/data\n";
+        let v = parse_df(text);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].source, "/dev/nvme0n1p2");
+        assert_eq!(v[0].mount, "/");
+        assert_eq!(v[0].total_kb, 491240);
+        assert_eq!(v[0].avail_kb, 170000);
+        assert_eq!(v[2].mount, "/mnt/data");
     }
 
     #[test]

@@ -66,6 +66,19 @@ pub struct GpuStats {
     pub bo_count: Option<u64>,
     pub bo_size_mb: Option<u64>,
     pub clients: Option<usize>,
+    /// 显卡型号（远端由 lspci 探测，本机 Pi 为 None）。
+    pub model: Option<String>,
+    /// 显卡温度（远端由 hwmon 探测）。
+    pub temp_c: Option<f32>,
+}
+
+/// 远端主机自述信息（SSH 采集时填写；本机为 None）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteInfo {
+    /// /etc/os-release 的 PRETTY_NAME。
+    pub os: String,
+    /// SSH 登录用户的 uid（用于「只看自己」过滤）。
+    pub uid: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -76,6 +89,7 @@ pub struct PiStats {
     pub power: Option<Power>,
     pub throttle: Option<Throttle>,
     pub rails: Vec<Rail>,
+    pub remote: Option<RemoteInfo>,
 }
 
 pub fn parse_temp_millideg(text: &str) -> Option<f32> {
@@ -214,6 +228,8 @@ pub fn read_gpu() -> GpuStats {
         bo_count: slow.bo_count,
         bo_size_mb: slow.bo_size_mb,
         clients: slow.clients,
+        model: None,
+        temp_c: None,
     }
 }
 
@@ -319,7 +335,7 @@ pub fn read_pi_stats() -> PiStats {
     let throttle = run_vcgencmd(&["get_throttled"]).and_then(|s| parse_throttled(&s));
     let gpu = read_gpu();
 
-    PiStats { temp_c, freq_ghz, gpu, power, throttle, rails }
+    PiStats { temp_c, freq_ghz, gpu, power, throttle, rails, remote: None }
 }
 
 #[cfg(test)]

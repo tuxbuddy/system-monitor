@@ -1,0 +1,125 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 桌面版构建所需系统库（egui/eframe 的 Wayland + X11 后端）
+  GUI_APT: libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev pkg-config
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装桌面构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $GUI_APT
+      - name: Clippy（桌面版）
+        run: cargo clippy --all-targets -- -D warnings
+      - name: 测试（桌面版）
+        run: cargo test --bin system-monitor
+      - name: Clippy（纯 TUI）
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: 测试（纯 TUI）
+        run: cargo test --no-default-features --bin system-monitor
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 桌面版（含 TUI：同一二进制加 --tui 即可）
+          - name: linux-x86_64-gui
+            target: x86_64-unknown-linux-gnu
+            flags: ""
+            gui: true
+          # 纯 TUI 版：不链接 egui，产物更小，可在无桌面的服务器上跑
+          - name: linux-x86_64-tui
+            target: x86_64-unknown-linux-gnu
+            flags: "--no-default-features"
+            gui: false
+          # 树莓派 / ARM64 服务器用的 TUI（交叉编译，纯 Rust 依赖）
+          - name: linux-aarch64-tui
+            target: aarch64-unknown-linux-gnu
+            flags: "--no-default-features"
+            gui: false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: 安装桌面构建依赖
+        if: matrix.gui
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $GUI_APT
+      - name: 配置 aarch64 交叉链接器
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+      - name: 构建
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.flags }}
+      - name: 冒烟（仅原生 x86_64）
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: ./target/${{ matrix.target }}/release/system-monitor --help
+      - name: 打包
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/system-monitor"
+          NAME="system-monitor-${{ matrix.name }}"
+          mkdir -p dist
+          if [ -n "${{ matrix.flags }}" ]; then
+            cp "$BIN" dist/system-monitor-tui
+            strip dist/system-monitor-tui 2>/dev/null || true
+            tar -C dist -czf "$NAME.tar.gz" system-monitor-tui
+          else
+            cp "$BIN" dist/system-monitor
+            strip dist/system-monitor 2>/dev/null || true
+            tar -C dist -czf "$NAME.tar.gz" system-monitor
+          fi
+          sha256sum "$NAME.tar.gz" > "$NAME.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            system-monitor-${{ matrix.name }}.tar.gz
+            system-monitor-${{ matrix.name }}.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

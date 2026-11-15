@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub alert_cpu: f32,
     pub alert_mem: f32,
     pub alert_temp: f32,
+    /// 顶部大盘（KPI 卡片行）是否展开。
+    pub dash_open: bool,
 }
 
 impl Default for AppConfig {
@@ -25,6 +27,7 @@ impl Default for AppConfig {
             alert_cpu: 90.0,
             alert_mem: 90.0,
             alert_temp: 80.0,
+            dash_open: true,
         }
     }
 }
@@ -32,7 +35,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn to_text(&self) -> String {
         format!(
-            "sort_col={}\nsort_desc={}\ninterval={}\ntable_mode={}\nown_only={}\nalert_cpu={}\nalert_mem={}\nalert_temp={}\n",
+            "sort_col={}\nsort_desc={}\ninterval={}\ntable_mode={}\nown_only={}\nalert_cpu={}\nalert_mem={}\nalert_temp={}\ndash_open={}\n",
             self.sort_col,
             self.sort_desc,
             self.interval,
@@ -40,7 +43,8 @@ impl AppConfig {
             self.own_only,
             self.alert_cpu,
             self.alert_mem,
-            self.alert_temp
+            self.alert_temp,
+            self.dash_open
         )
     }
 }
@@ -90,6 +94,13 @@ pub fn parse(text: &str) -> AppConfig {
                     c.alert_temp = x;
                 }
             }
+            "dash_open" => {
+                if v == "true" {
+                    c.dash_open = true;
+                } else if v == "false" {
+                    c.dash_open = false;
+                }
+            }
             _ => {}
         }
     }
@@ -133,6 +144,7 @@ mod tests {
             alert_cpu: 85.0,
             alert_mem: 80.0,
             alert_temp: 75.0,
+            dash_open: false,
         };
         assert_eq!(parse(&c.to_text()), c);
     }

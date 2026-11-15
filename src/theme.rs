@@ -143,9 +143,9 @@ pub fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(14))
-        .shadow(Shadow { offset: [0, 2], blur: 8, spread: 0, color: Color32::from_black_alpha(50) })
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(12))
+        .shadow(Shadow { offset: [0, 2], blur: 10, spread: 0, color: Color32::from_black_alpha(45) })
 }
 
 /// 把颜色向卡片表面色混合，amount=0 得表面色，1 得原色。用于徽章/按钮的淡色底。
