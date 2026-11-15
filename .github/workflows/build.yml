@@ -26,11 +26,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y $GUI_APT
       - name: Clippy（桌面版）
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          set +e
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-gui.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -m 8 -E "^(error|warning)" clippy-gui.log | while IFS= read -r line; do
+              echo "::error title=clippy（桌面版）::$line"
+            done
+            exit "$code"
+          fi
       - name: 测试（桌面版）
         run: cargo test --bin system-monitor
       - name: Clippy（纯 TUI）
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: |
+          set +e
+          cargo clippy --no-default-features --all-targets -- -D warnings 2>&1 | tee clippy-tui.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -m 8 -E "^(error|warning)" clippy-tui.log | while IFS= read -r line; do
+              echo "::error title=clippy（纯 TUI）::$line"
+            done
+            exit "$code"
+          fi
       - name: 测试（纯 TUI）
         run: cargo test --no-default-features --bin system-monitor
 
