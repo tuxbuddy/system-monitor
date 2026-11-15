@@ -63,7 +63,7 @@ pub struct App {
     last: Instant,
     interval: Duration,
     history: VecDeque<f32>,
-    hosts: Vec<String>,
+    hosts: Vec<remote::SshTarget>,
     host_idx: Option<usize>,
     shared: Arc<Mutex<Option<remote::RemoteSample>>>,
     prev: Arc<Mutex<Option<remote::Counters>>>,
@@ -89,7 +89,7 @@ impl App {
             last: Instant::now() - Duration::from_secs(10),
             interval,
             history: VecDeque::new(),
-            hosts: remote::load_hosts(),
+            hosts: remote::load_hosts().0,
             host_idx: None,
             shared: Arc::new(Mutex::new(None)),
             prev: Arc::new(Mutex::new(None)),
@@ -106,12 +106,12 @@ impl App {
         }
     }
 
-    fn host(&self) -> Option<String> {
+    fn host(&self) -> Option<remote::SshTarget> {
         self.host_idx.and_then(|i| self.hosts.get(i).cloned())
     }
 
     fn host_label(&self) -> String {
-        self.host().unwrap_or_else(|| "本地".to_string())
+        self.host().map(|t| t.as_str().to_string()).unwrap_or_else(|| "本地".to_string())
     }
 
     fn resample(&mut self) {
@@ -132,7 +132,7 @@ impl App {
         }
     }
 
-    fn resample_remote(&mut self, target: &str) {
+    fn resample_remote(&mut self, target: &remote::SshTarget) {
         let kick = self.last_kick.elapsed() >= self.interval && !self.busy.load(Ordering::Relaxed);
         if kick && !self.paused {
             self.busy.store(true, Ordering::Relaxed);
@@ -140,7 +140,7 @@ impl App {
             let shared = self.shared.clone();
             let prev = self.prev.clone();
             let busy = self.busy.clone();
-            let t = target.to_string();
+            let t = target.clone();
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
                 let res = remote::collect(&t, &mut p);

@@ -212,15 +212,15 @@ pub struct CpuManagerApp {
     shared: Arc<Mutex<SharedMetrics>>,
     mini: bool,
     platform_edit: Option<String>,
-    hosts: Vec<String>,
-    host_sel: Option<String>,
+    hosts: Vec<remote::SshTarget>,
+    host_sel: Option<remote::SshTarget>,
     add_host: Option<String>,
     remote_shared: Arc<Mutex<Option<remote::RemoteSample>>>,
     remote_prev: Arc<Mutex<Option<remote::Counters>>>,
     remote_busy: Arc<AtomicBool>,
     last_remote_kick: Instant,
     fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>>,
-    fleet_hosts: Arc<Mutex<Vec<String>>>,
+    fleet_hosts: Arc<Mutex<Vec<remote::SshTarget>>>,
     local_view: Option<(Usage, PiStats)>,
     remote_write: bool,
     remote_cg_base: Option<(String, String)>,
@@ -249,6 +249,8 @@ pub struct CpuManagerApp {
     probe_test_cmd: String,
     probe_test_child: Option<std::process::Child>,
     probe_armed_pid: Option<u32>,
+    /// 历史写入失败的一次性报告（同错误不重复提示）。
+    hist_err: Option<String>,
 }
 
 impl CpuManagerApp {
@@ -262,7 +264,16 @@ impl CpuManagerApp {
         };
         let shared = Arc::new(Mutex::new(SharedMetrics::default()));
         start_metrics_server(shared.clone());
-        let hosts = remote::load_hosts();
+        let (hosts, hosts_errors) = remote::load_hosts();
+        let hosts_warn = if hosts_errors.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "hosts.conf 有 {} 行非法目标（已忽略）：{}",
+                hosts_errors.len(),
+                hosts_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("；")
+            ))
+        };
         let fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>> = Arc::new(Mutex::new(HashMap::new()));
         let fleet_hosts = Arc::new(Mutex::new(hosts.clone()));
         start_fleet_poller(fleet.clone(), fleet_hosts.clone());
@@ -347,8 +358,13 @@ impl CpuManagerApp {
             probe_test_cmd: String::new(),
             probe_test_child: None,
             probe_armed_pid: None,
+            hist_err: None,
         };
         app.saved_cfg = app.current_config();
+        if let Some(w) = hosts_warn {
+            app.status_error = true;
+            app.status = w;
+        }
         load_history_into(&mut app.perf);
         app.resample();
         app
@@ -444,7 +460,7 @@ impl CpuManagerApp {
         }
     }
 
-    fn resample_remote(&mut self, target: &str) {
+    fn resample_remote(&mut self, target: &remote::SshTarget) {
         let kick = self.last_remote_kick.elapsed() >= Duration::from_secs(2)
             && !self.remote_busy.load(Ordering::Relaxed);
         if kick {
@@ -453,7 +469,7 @@ impl CpuManagerApp {
             let shared = self.remote_shared.clone();
             let prev = self.remote_prev.clone();
             let busy = self.remote_busy.clone();
-            let t = target.to_string();
+            let t = target.clone();
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
                 let res = remote::collect(&t, &mut p);
@@ -839,16 +855,13 @@ impl CpuManagerApp {
         let Some(p) = history_path() else {
             return;
         };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let mem = self
             .usage
             .mem
             .map(|m| if m.total_kb == 0 { 0.0 } else { m.used_kb() as f32 / m.total_kb as f32 * 100.0 })
             .unwrap_or(0.0);
         let line = format!(
-            "{:.1},{:.1},{:.1},{:.2},{:.2},{:.1},{:.1},{:.1},{:.1}\n",
+            "{:.1},{:.1},{:.1},{:.2},{:.2},{:.1},{:.1},{:.1},{:.1}",
             self.usage.total_percent,
             mem,
             self.pi.temp_c.unwrap_or(0.0),
@@ -859,14 +872,25 @@ impl CpuManagerApp {
             self.usage.net_rx_bps / 1024.0,
             self.usage.net_tx_bps / 1024.0,
         );
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-            let _ = f.write_all(line.as_bytes());
+        // 原子目录 + 单行上限 + 大小轮转（5 MB × 3 份），失败只报告一次不刷屏
+        if let Err(e) = crate::fsutil::append_line_capped(&p, &line, 5 * 1024 * 1024, 3, 4096)
+            && self.hist_err.as_ref().is_none_or(|prev| prev != &e.to_string())
+        {
+            self.hist_err = Some(e.to_string());
         }
     }
 
     fn select_host(&mut self, sel: Option<String>) {
-        self.host_sel = sel;
+        // UI 传来的字符串在此边界一次性校验；非法目标不进入任何远端调用
+        let parsed = sel.map(|s| remote::SshTarget::parse(&s)).transpose();
+        self.host_sel = match parsed {
+            Ok(t) => t,
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("主机目标非法：{e}");
+                return;
+            }
+        };
         self.remote_cg_base = None;
         self.pi = PiStats::default();
         self.usage = Usage::default();
@@ -970,7 +994,10 @@ impl CpuManagerApp {
     fn persist_if_changed(&mut self) {
         let cfg = self.current_config();
         if cfg != self.saved_cfg {
-            config::save(&cfg);
+            if let Err(e) = config::save(&cfg) {
+                self.status_error = true;
+                self.status = format!("配置保存失败：{e}");
+            }
             self.saved_cfg = cfg;
         }
     }
@@ -1254,7 +1281,7 @@ impl CpuManagerApp {
                 ui.separator();
                 ui.add_space(6.0);
                 ui.label(RichText::new("主机").size(11.5).color(theme::TEXT_MUTED));
-                let mut hs = self.host_sel.clone();
+                let mut hs = self.host_sel.as_ref().map(|t| t.as_str().to_string());
                 let hbefore = hs.clone();
                 let hcur = hs.clone().unwrap_or_else(|| "本地".to_string());
                 egui::ComboBox::from_id_salt("top_host")
@@ -1263,7 +1290,7 @@ impl CpuManagerApp {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut hs, None, "本地");
                         for h in &self.hosts {
-                            ui.selectable_value(&mut hs, Some(h.clone()), h.as_str());
+                            ui.selectable_value(&mut hs, Some(h.as_str().to_string()), h.as_str());
                         }
                     });
                 if hs != hbefore {
@@ -2298,15 +2325,16 @@ impl CpuManagerApp {
             rows.push((None, "本地".to_string(), String::new(), ok, cpu, mem, temp, gpu, load, procs));
         }
         let fleet = self.fleet.lock().ok().map(|f| f.clone()).unwrap_or_default();
-        for h in self.hosts.clone() {
-            let (ok, os, cpu, mem, temp, gpu, load, procs) = match fleet.get(&h) {
+        for h in &self.hosts {
+            let key = h.as_str();
+            let (ok, os, cpu, mem, temp, gpu, load, procs) = match fleet.get(key) {
                 Some(s) => (s.ok, s.os.clone(), s.cpu, s.mem, s.temp, s.gpu, s.load1, s.procs),
                 None => (false, String::new(), 0.0, 0.0, 0.0, 0.0, 0.0, 0),
             };
-            rows.push((Some(h.clone()), h, os, ok, cpu, mem, temp, gpu, load, procs));
+            rows.push((Some(key.to_string()), key.to_string(), os, ok, cpu, mem, temp, gpu, load, procs));
         }
 
-        let selected = self.host_sel.clone();
+        let selected = self.host_sel.as_ref().map(|t| t.as_str().to_string());
         for (sel, label, os, ok, cpu, mem, temp, gpu, load, procs) in rows {
             let is_cur = sel == selected;
             egui::Frame::NONE
@@ -3329,17 +3357,31 @@ impl CpuManagerApp {
                 });
             });
             if add {
-                let h = text.trim().to_string();
-                if !h.is_empty() && !self.hosts.contains(&h) {
-                    self.hosts.push(h.clone());
-                    remote::save_hosts(&self.hosts);
-                    if let Ok(mut fh) = self.fleet_hosts.lock() {
-                        fh.push(h.clone());
+                let raw = text.trim().to_string();
+                match remote::SshTarget::parse(&raw) {
+                    Ok(t) => {
+                        if !self.hosts.contains(&t) {
+                            self.hosts.push(t.clone());
+                            if let Err(e) = remote::save_hosts(&self.hosts) {
+                                self.status_error = true;
+                                self.status = e;
+                            } else {
+                                self.status_error = false;
+                                self.status = format!("已添加主机 {t}");
+                            }
+                            if let Ok(mut fh) = self.fleet_hosts.lock() {
+                                fh.push(t);
+                            }
+                        }
+                        self.add_host = None;
                     }
-                    self.status_error = false;
-                    self.status = format!("已添加主机 {h}");
+                    // 非法目标留在输入框里让用户修正，不落盘
+                    Err(e) => {
+                        self.status_error = true;
+                        self.status = format!("主机目标非法：{e}");
+                        self.add_host = Some(text);
+                    }
                 }
-                self.add_host = None;
             } else if cancel {
                 self.add_host = None;
             } else {
@@ -3702,20 +3744,27 @@ fn helper_install_hint() -> String {
 
 fn start_fleet_poller(
     fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>>,
-    hosts: Arc<Mutex<Vec<String>>>,
+    hosts: Arc<Mutex<Vec<remote::SshTarget>>>,
 ) {
     std::thread::spawn(move || {
         let mut prev: HashMap<String, Option<remote::Counters>> = HashMap::new();
         loop {
-            std::thread::sleep(Duration::from_secs(5));
+            let round_start = Instant::now();
             let list = hosts.lock().map(|h| h.clone()).unwrap_or_default();
             for target in list {
-                let mut p = prev.remove(&target).flatten();
+                let key = target.as_str().to_string();
+                let mut p = prev.remove(&key).flatten();
+                // 每台主机独立 10s deadline：一台挂住不会拖住整轮
                 let s = remote::summary(&target, &mut p);
-                prev.insert(target.clone(), p);
+                prev.insert(key.clone(), p);
                 if let Ok(mut f) = fleet.lock() {
-                    f.insert(target.clone(), s);
+                    f.insert(key, s);
                 }
+            }
+            // 下一轮 = 本轮开始 + 5s，避免串行 SSH 耗时造成刷新周期漂移
+            let spent = round_start.elapsed();
+            if spent < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_secs(5) - spent);
             }
         }
     });

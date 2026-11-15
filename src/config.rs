@@ -119,14 +119,13 @@ pub fn load() -> AppConfig {
     }
 }
 
-pub fn save(c: &AppConfig) {
+/// 原子写入配置（0600；同目录临时文件 + rename，中断不留半截文件）。
+pub fn save(c: &AppConfig) -> std::io::Result<()> {
+    use crate::fsutil;
     let Some(p) = path() else {
-        return;
+        return Ok(());
     };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(p, c.to_text());
+    fsutil::atomic_write(&p, c.to_text().as_bytes(), fsutil::MODE_PRIVATE)
 }
 
 #[cfg(test)]

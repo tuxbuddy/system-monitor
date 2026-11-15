@@ -5,6 +5,7 @@
 mod actions;
 mod cgroup;
 mod config;
+mod fsutil;
 mod mcp;
 mod pi;
 mod platform;
@@ -12,6 +13,7 @@ mod probe;
 mod probeclient;
 mod procstats;
 mod remote;
+mod sshtarget;
 mod tui;
 #[cfg(feature = "gui")]
 mod app;
