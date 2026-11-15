@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=系统监视器
+Comment=监控系统资源（CPU/内存/IO/能效供电）并调控进程、调度与性能
+Exec=/home/zhangyi/project/cpu-manager/target/release/system-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
