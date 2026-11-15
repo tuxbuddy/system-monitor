@@ -212,6 +212,8 @@ pub struct CpuManagerApp {
     fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>>,
     fleet_hosts: Arc<Mutex<Vec<String>>>,
     local_view: Option<(Usage, PiStats)>,
+    remote_write: bool,
+    remote_cg_base: Option<(String, String)>,
     alert_cpu: f32,
     alert_mem: f32,
     alert_temp: f32,
@@ -307,6 +309,8 @@ impl CpuManagerApp {
             fleet,
             fleet_hosts,
             local_view: None,
+            remote_write: false,
+            remote_cg_base: None,
             alert_cpu: cfg.alert_cpu,
             alert_mem: cfg.alert_mem,
             alert_temp: cfg.alert_temp,
@@ -503,10 +507,59 @@ impl CpuManagerApp {
     }
 
     fn refresh_groups(&mut self) {
+        if let Some(h) = self.host_sel.clone() {
+            if !self.remote_write {
+                self.groups.clear();
+                return;
+            }
+            let base = self.remote_cg_base_for(&h);
+            self.groups = match base {
+                Some(b) => remote::cg_list(&h, &b),
+                None => Vec::new(),
+            };
+            return;
+        }
         if let Some(m) = &self.mgr {
             self.groups = m.list_groups().unwrap_or_default();
         } else {
             self.groups.clear();
+        }
+    }
+
+    fn remote_cg_base_for(&mut self, host: &str) -> Option<String> {
+        if let Some((h, b)) = &self.remote_cg_base
+            && h == host
+        {
+            return Some(b.clone());
+        }
+        let base = remote::cg_base(host)?;
+        remote::cg_ensure(host, &base);
+        self.remote_cg_base = Some((host.to_string(), base.clone()));
+        Some(base)
+    }
+
+    /// 远端写调度就绪时返回 (host, base)。
+    fn cg_remote(&mut self) -> Option<(String, String)> {
+        if !self.remote_write {
+            return None;
+        }
+        let h = self.host_sel.clone()?;
+        let b = self.remote_cg_base_for(&h)?;
+        Some((h, b))
+    }
+
+    fn remote_write_host(&self) -> Option<String> {
+        if self.remote_write { self.host_sel.clone() } else { None }
+    }
+
+    fn finish_remote(&mut self, ok: bool, ok_msg: String) {
+        if ok {
+            self.status_error = false;
+            self.status = ok_msg;
+            self.refresh_groups();
+        } else {
+            self.status_error = true;
+            self.status = "远程操作失败（主机/权限/委派 cgroup）".to_string();
         }
     }
 
@@ -525,24 +578,74 @@ impl CpuManagerApp {
         }
     }
 
+    fn do_create_group(&mut self, name: &str) {
+        if let Some((h, base)) = self.cg_remote() {
+            let ok = remote::cg_create(&h, &base, name);
+            if ok {
+                self.sel_group = Some(name.to_string());
+                self.new_group.clear();
+            }
+            self.finish_remote(ok, format!("已创建分组 {name}（远程）"));
+            return;
+        }
+        let res = self.mgr.as_ref().map(|m| m.create_group(name));
+        self.finish_cg(res, format!("已创建分组 {name}"));
+        if !self.status_error {
+            self.sel_group = Some(name.to_string());
+            self.new_group.clear();
+        }
+    }
+
     fn do_set_cpu_max(&mut self, group: &str, pct: Option<u32>) {
+        if let Some((h, base)) = self.cg_remote() {
+            let ok = remote::cg_set_cpu_max(&h, &base, group, pct);
+            let cap = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "不限".into());
+            self.finish_remote(ok, format!("分组 {group} CPU 上限 → {cap}（远程）"));
+            return;
+        }
         let res = self.mgr.as_ref().map(|m| m.set_cpu_max(group, pct));
         let cap = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "不限".into());
         self.finish_cg(res, format!("分组 {group} CPU 上限 → {cap}"));
     }
 
     fn do_set_cpu_weight(&mut self, group: &str, weight: u32) {
+        if let Some((h, base)) = self.cg_remote() {
+            let ok = remote::cg_set_weight(&h, &base, group, weight);
+            self.finish_remote(ok, format!("分组 {group} 权重 → {weight}（远程）"));
+            return;
+        }
         let res = self.mgr.as_ref().map(|m| m.set_cpu_weight(group, weight));
         self.finish_cg(res, format!("分组 {group} 权重 → {weight}"));
     }
 
     fn do_set_pids_max(&mut self, group: &str, max: Option<u32>) {
+        if let Some((h, base)) = self.cg_remote() {
+            let ok = remote::cg_set_pids(&h, &base, group, max);
+            let cap = max.map(|m| m.to_string()).unwrap_or_else(|| "不限".into());
+            self.finish_remote(ok, format!("分组 {group} 进程数上限 → {cap}（远程）"));
+            return;
+        }
         let res = self.mgr.as_ref().map(|m| m.set_pids_max(group, max));
         let cap = max.map(|m| m.to_string()).unwrap_or_else(|| "不限".into());
         self.finish_cg(res, format!("分组 {group} 进程数上限 → {cap}"));
     }
 
     fn do_join_group(&mut self, group: &str, pid: i32) {
+        if let Some((h, base)) = self.cg_remote() {
+            match remote::cg_move_in(&h, &base, group, pid) {
+                Some(orig) => {
+                    self.original_of.insert(pid, PathBuf::from(orig));
+                    self.status_error = false;
+                    self.status = format!("进程 {pid} 已加入分组 {group}（远程）");
+                    self.refresh_groups();
+                }
+                None => {
+                    self.status_error = true;
+                    self.status = "远程迁入失败（主机/权限/委派）".to_string();
+                }
+            }
+            return;
+        }
         let res = self.mgr.as_ref().map(|m| m.move_in(group, pid));
         match res {
             Some(Ok(orig)) => {
@@ -560,6 +663,14 @@ impl CpuManagerApp {
     }
 
     fn do_leave_group(&mut self, pid: i32) {
+        if let Some(h) = self.remote_write_host() {
+            self.auto_skip.insert(pid);
+            if let Some(orig) = self.original_of.remove(&pid) {
+                let ok = remote::cg_release(&h, &orig.to_string_lossy(), pid);
+                self.finish_remote(ok, format!("进程 {pid} 已移出分组（远程）"));
+            }
+            return;
+        }
         self.auto_skip.insert(pid);
         let Some(orig) = self.original_of.remove(&pid) else {
             return;
@@ -569,6 +680,14 @@ impl CpuManagerApp {
     }
 
     fn do_delete_group(&mut self, group: &str) {
+        if let Some((h, base)) = self.cg_remote() {
+            let ok = remote::cg_delete(&h, &base, group);
+            if self.sel_group.as_deref() == Some(group) {
+                self.sel_group = None;
+            }
+            self.finish_remote(ok, format!("已删除分组 {group}（远程）"));
+            return;
+        }
         let res = self.mgr.as_ref().map(|m| m.delete_group(group));
         if self.sel_group.as_deref() == Some(group) {
             self.sel_group = None;
@@ -577,6 +696,20 @@ impl CpuManagerApp {
     }
 
     fn dissolve_all_limits(&mut self) {
+        if let Some((h, base)) = self.cg_remote() {
+            let names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
+            for n in &names {
+                remote::cg_set_cpu_max(&h, &base, n, None);
+            }
+            let origs: Vec<(i32, PathBuf)> = self.original_of.drain().collect();
+            for (pid, orig) in &origs {
+                remote::cg_release(&h, &orig.to_string_lossy(), *pid);
+            }
+            self.status_error = false;
+            self.status = "已解除全部限速（远程）".to_string();
+            self.refresh_groups();
+            return;
+        }
         let names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
         if let Some(m) = &self.mgr {
             for n in &names {
@@ -626,6 +759,7 @@ impl CpuManagerApp {
 
     fn select_host(&mut self, sel: Option<String>) {
         self.host_sel = sel;
+        self.remote_cg_base = None;
         if let Ok(mut s) = self.remote_shared.lock() {
             *s = None;
         }
@@ -1486,10 +1620,13 @@ impl CpuManagerApp {
 
     fn scheduler_view(&mut self, ui: &mut egui::Ui) {
         let remote = self.host_sel.is_some();
-        let available = self.mgr.is_some() && !remote;
+        let remote_write = remote && self.remote_write;
+        let available = (self.mgr.is_some() && !remote) || remote_write;
         egui::ScrollArea::vertical().show(ui, |ui| {
-        let (banner, color) = if remote {
-            ("远程主机：只读监视（调度仅本机可用）".to_string(), theme::WARNING)
+        let (banner, color) = if remote && !remote_write {
+            ("远程主机：只读（勾选『允许调度远端』可管理）".to_string(), theme::WARNING)
+        } else if remote_write {
+            (format!("远程调度：{}（写，仅本机用户进程）", self.host_sel.clone().unwrap_or_default()), theme::WARNING)
         } else if available {
             ("可调度：用户 cgroup（cpu / pids）".to_string(), theme::SUCCESS)
         } else {
@@ -1505,6 +1642,24 @@ impl CpuManagerApp {
             .show(ui, |ui| {
                 ui.label(RichText::new(banner).size(12.5).color(color));
             });
+        if remote {
+            ui.add_space(6.0);
+            let mut rw = self.remote_write;
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut rw, RichText::new("允许调度远端（写操作）").size(12.0));
+                ui.label(RichText::new("仅作用于该主机上你自己的进程，改动可逆").size(11.0).color(theme::TEXT_MUTED));
+            });
+            if rw != self.remote_write {
+                self.remote_write = rw;
+                self.remote_cg_base = None;
+                if rw {
+                    self.refresh_groups();
+                } else {
+                    self.groups.clear();
+                    self.original_of.clear();
+                }
+            }
+        }
         ui.add_space(10.0);
 
         section_card(ui, "分组", |ui| {
@@ -1517,12 +1672,7 @@ impl CpuManagerApp {
                 let name = self.new_group.trim().to_string();
                 let valid = crate::cgroup::valid_group_name(&name);
                 if action_btn(ui, "创建", theme::SUCCESS, available && valid, false) {
-                    let res = self.mgr.as_ref().map(|m| m.create_group(&name));
-                    self.finish_cg(res, format!("已创建分组 {name}"));
-                    if !self.status_error {
-                        self.sel_group = Some(name.clone());
-                        self.new_group.clear();
-                    }
+                    self.do_create_group(&name);
                 }
                 if !name.is_empty() && !valid {
                     ui.label(RichText::new("名称含非法字符").size(11.0).color(theme::DANGER));
@@ -1629,18 +1779,17 @@ impl CpuManagerApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("成员").size(12.0).color(theme::TEXT_SEC));
                     if let Some(pid) = self.selected {
-                        match self.mgr.as_ref().and_then(|m| m.group_of(pid)) {
-                            None => {
-                                if action_btn(ui, "加入当前选中进程", theme::SUCCESS, available, false) {
-                                    self.do_join_group(&grp, pid);
-                                }
+                        let managed = if remote {
+                            self.original_of.contains_key(&pid)
+                        } else {
+                            self.mgr.as_ref().and_then(|m| m.group_of(pid)).is_some()
+                        };
+                        if !managed {
+                            if action_btn(ui, "加入当前选中进程", theme::SUCCESS, available, false) {
+                                self.do_join_group(&grp, pid);
                             }
-                            Some(cg) => {
-                                ui.label(RichText::new(format!("当前在 {cg}")).size(11.0).color(theme::TEXT_MUTED));
-                                if action_btn(ui, "移出当前选中进程", theme::WARNING, available, false) {
-                                    self.do_leave_group(pid);
-                                }
-                            }
+                        } else if action_btn(ui, "移出当前选中进程", theme::WARNING, available, false) {
+                            self.do_leave_group(pid);
                         }
                     } else {
                         ui.label(RichText::new("（在监控页选中一个进程后可加入）").size(11.0).color(theme::TEXT_MUTED));

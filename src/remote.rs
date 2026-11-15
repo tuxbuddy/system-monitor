@@ -248,6 +248,140 @@ pub fn summary(target: &str, prev: &mut Option<Counters>) -> FleetSummary {
     }
 }
 
+// ---- 远端 cgroup（写操作，仅在用户显式允许时调用）----
+// 只作用于该主机上「当前用户」的分组；所有名字经白名单校验，路径来自远端 /proc，均做基本转义校验。
+
+use crate::cgroup::{self, GroupState};
+
+fn ssh_sh(target: &str, script: &str) -> Option<String> {
+    let out = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=6"])
+        .arg(target)
+        .arg(script)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 从远端 `cat /proc/self/cgroup; id -u` 的输出里取 user@uid.service 委派根。
+pub fn parse_remote_base(text: &str) -> Option<String> {
+    let uid: u32 = text.lines().rev().find_map(|l| l.trim().parse().ok())?;
+    let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let marker = format!("user@{uid}.service");
+    let mut acc: Vec<&str> = Vec::new();
+    for seg in path.split('/').filter(|x| !x.is_empty()) {
+        acc.push(seg);
+        if seg == marker {
+            return Some(format!("/sys/fs/cgroup/{}", acc.join("/")));
+        }
+    }
+    None
+}
+
+pub fn cg_base(target: &str) -> Option<String> {
+    parse_remote_base(&ssh_sh(target, "cat /proc/self/cgroup; id -u")?)
+}
+
+/// 建并准备容器 cm-sched（+cpu +pids）。
+pub fn cg_ensure(target: &str, base: &str) -> bool {
+    let c = format!("{base}/cm-sched");
+    ssh_sh(
+        target,
+        &format!("mkdir -p '{c}' && printf '+cpu +pids' > '{c}/cgroup.subtree_control' 2>/dev/null; echo READY"),
+    )
+    .map(|s| s.contains("READY"))
+    .unwrap_or(false)
+}
+
+fn parse_group_lines(text: &str) -> Vec<GroupState> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('|').collect();
+        if f.len() != 5 {
+            continue;
+        }
+        let pids_max = {
+            let t = f[3].trim();
+            if t.is_empty() || t == "max" { None } else { t.parse().ok() }
+        };
+        out.push(GroupState {
+            name: f[0].to_string(),
+            cpu_max_pct: cgroup::parse_cpu_max(f[1]),
+            cpu_weight: f[2].trim().parse().unwrap_or(100),
+            pids_max,
+            procs: f[4].trim().parse().unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+pub fn cg_list(target: &str, base: &str) -> Vec<GroupState> {
+    let c = format!("{base}/cm-sched");
+    let script = format!(
+        "cd '{c}' 2>/dev/null || exit 0; for d in */; do n=${{d%/}}; [ \"$n\" = default ] && continue; \
+printf '%s|%s|%s|%s|%s\\n' \"$n\" \"$(cat \"$d/cpu.max\" 2>/dev/null)\" \"$(cat \"$d/cpu.weight\" 2>/dev/null)\" \"$(cat \"$d/pids.max\" 2>/dev/null)\" \"$(grep -c . \"$d/cgroup.procs\" 2>/dev/null)\"; done"
+    );
+    parse_group_lines(&ssh_sh(target, &script).unwrap_or_default())
+}
+
+fn safe_name(name: &str) -> bool {
+    cgroup::valid_group_name(name)
+}
+
+pub fn cg_create(target: &str, base: &str, name: &str) -> bool {
+    safe_name(name) && ssh_sh(target, &format!("mkdir '{base}/cm-sched/{name}'")).is_some()
+}
+
+pub fn cg_delete(target: &str, base: &str, name: &str) -> bool {
+    safe_name(name) && ssh_sh(target, &format!("rmdir '{base}/cm-sched/{name}'")).is_some()
+}
+
+pub fn cg_set_cpu_max(target: &str, base: &str, name: &str, pct: Option<u32>) -> bool {
+    if !safe_name(name) {
+        return false;
+    }
+    let val = match pct {
+        Some(p) if p > 0 => format!("{} 100000", p.saturating_mul(1000)),
+        _ => "max 100000".to_string(),
+    };
+    ssh_sh(target, &format!("printf '{val}' > '{base}/cm-sched/{name}/cpu.max'")).is_some()
+}
+
+pub fn cg_set_weight(target: &str, base: &str, name: &str, w: u32) -> bool {
+    safe_name(name) && ssh_sh(target, &format!("printf '{}' > '{base}/cm-sched/{name}/cpu.weight'", w.clamp(1, 10000))).is_some()
+}
+
+pub fn cg_set_pids(target: &str, base: &str, name: &str, max: Option<u32>) -> bool {
+    if !safe_name(name) {
+        return false;
+    }
+    let val = max.map(|m| m.max(1).to_string()).unwrap_or_else(|| "max".to_string());
+    ssh_sh(target, &format!("printf '{val}' > '{base}/cm-sched/{name}/pids.max'")).is_some()
+}
+
+/// 迁入并返回原 cgroup 路径（形如 /user.slice/...），供还原。
+pub fn cg_move_in(target: &str, base: &str, name: &str, pid: i32) -> Option<String> {
+    if !safe_name(name) {
+        return None;
+    }
+    let c = format!("{base}/cm-sched/{name}");
+    let script = format!(
+        "o=$(sed -n 's|^0::||p' /proc/{pid}/cgroup); printf '{pid}' > '{c}/cgroup.procs' && printf '%s' \"$o\""
+    );
+    ssh_sh(target, &script).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn cg_release(target: &str, original: &str, pid: i32) -> bool {
+    if original.is_empty() || original.contains('\'') || original.contains(';') {
+        return false;
+    }
+    ssh_sh(target, &format!("printf '{pid}' > '/sys/fs/cgroup{original}/cgroup.procs'")).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +424,30 @@ mod tests {
         assert!(r.is_some(), "本机脚本输出应可解析");
         let (u, _) = r.unwrap();
         assert!(!u.procs.is_empty(), "应解析到进程列表");
+    }
+
+    #[test]
+    fn remote_base_parse() {
+        let text = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/x.scope\n1000\n";
+        assert_eq!(
+            parse_remote_base(text),
+            Some("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service".to_string())
+        );
+        assert_eq!(parse_remote_base("0::/user.slice/session-3.scope\n1000\n"), None);
+    }
+
+    #[test]
+    fn group_lines_parse() {
+        let t = "build|50000 100000|200|64|3\nbg|max 100000|100|max|0\n";
+        let g = parse_group_lines(t);
+        assert_eq!(g.len(), 2);
+        let b = g.iter().find(|x| x.name == "build").unwrap();
+        assert_eq!(b.cpu_max_pct, Some(50));
+        assert_eq!(b.cpu_weight, 200);
+        assert_eq!(b.pids_max, Some(64));
+        assert_eq!(b.procs, 3);
+        let bg = g.iter().find(|x| x.name == "bg").unwrap();
+        assert_eq!(bg.cpu_max_pct, None);
+        assert_eq!(bg.pids_max, None);
     }
 }
