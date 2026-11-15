@@ -28,12 +28,13 @@ jobs:
       - name: Clippy（桌面版）
         run: |
           set +e
-          cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-gui.log
+          CARGO_TERM_COLOR=never cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-gui.log
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
-            grep -m 8 -E "^(error|warning)" clippy-gui.log | while IFS= read -r line; do
+            sed 's/\x1b\[[0-9;]*m//g' clippy-gui.log | grep -m 10 -E "^(error|warning)" | while IFS= read -r line; do
               echo "::error title=clippy（桌面版）::$line"
             done
+            sed 's/\x1b\[[0-9;]*m//g' clippy-gui.log | tail -40 | while IFS= read -r line; do echo "::warning title=clippy 尾部::$line"; done
             exit "$code"
           fi
       - name: 测试（桌面版）
