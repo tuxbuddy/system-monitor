@@ -886,6 +886,12 @@ pub struct Sampler {
     prev_at: Instant,
 }
 
+impl Default for Sampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sampler {
     pub fn new() -> Self {
         Self { prev: None, prev_at: Instant::now() }

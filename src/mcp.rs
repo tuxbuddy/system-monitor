@@ -388,7 +388,23 @@ impl Server {
             }
             "psi_status" => {
                 let snap = crate::psi::read_local();
-                Ok(json!({"host": "local", "pressure": snap.to_json()}))
+                // cgroup v2 委派根下的 *.pressure 作为补充源(本地 /proc/pressure 缺失时尤其有用)
+                let cg = std::env::var_os("HOME")
+                    .and_then(|_| {
+                        let uid = unsafe { libc::getuid() };
+                        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+                        crate::cgroup::parse_self_cgroup(&text, uid)
+                    })
+                    .and_then(|rel| std::fs::read_to_string("/sys/fs/cgroup").ok().map(|_| rel));
+                let cgroup_pressure = cg.map(|rel| {
+                    let dir = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
+                    crate::psi::read_cgroup(&dir)
+                });
+                Ok(json!({
+                    "host": "local",
+                    "pressure": snap.to_json(),
+                    "cgroup_pressure": cgroup_pressure.map(|p| p.to_json()),
+                }))
             }
             "scheduler_status" => {
                 // cgroup 调度体检：逐步报告委派/控制器/可写性，失败给修复建议
@@ -662,11 +678,7 @@ fn freshness_json(v: &View) -> Value {
 }
 
 fn system_oom_kill() -> Option<u64> {
-    let t = std::fs::read_to_string("/proc/vmstat").ok()?;
-    t.lines()
-        .find(|l| l.starts_with("oom_kill "))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    std::fs::read_to_string("/proc/vmstat").ok().and_then(|t| procstats::parse_vmstat_oom_kill(&t))
 }
 
 fn overview_json(v: &View) -> Value {

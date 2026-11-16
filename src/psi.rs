@@ -37,7 +37,7 @@ impl PsiSnapshot {
     }
 
     /// JSON（MCP/导出共用）；unsupported 类输出 null 而不是 0。
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(self) -> Value {
         let res = |r: &Option<PsiResource>| match r {
             None => Value::Null,
             Some(r) => json!({
@@ -114,6 +114,7 @@ pub fn read_local() -> PsiSnapshot {
 }
 
 /// cgroup v2 的 `cpu.pressure` / `memory.pressure` / `io.pressure`（同格式）。
+#[allow(dead_code)] // GUI 趋势页接入时复用;本地 /proc 不可用时作为补充源
 pub fn read_cgroup(dir: &std::path::Path) -> PsiSnapshot {
     let read = |name: &str| -> Option<PsiResource> {
         let text = std::fs::read_to_string(dir.join(format!("{name}.pressure"))).ok()?;

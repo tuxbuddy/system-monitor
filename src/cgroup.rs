@@ -95,7 +95,9 @@ fn cleanup_created(container: &Path, created_now: bool) {
     }
 }
 
-/// 分组内核统计（#20）。
+/// 分组内核统计（#20）。GUI 分组卡片与 MCP scheduler_groups 消费；
+/// 远端路径经 GroupState.throttle 携带,本结构供本地精细查询扩展。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CgStats {
     pub cpu: CpuStat,
@@ -105,6 +107,7 @@ pub struct CgStats {
     pub pids_current: Option<u64>,
 }
 
+#[allow(dead_code)]
 impl CgStats {
     /// 节流时间占比：throttled_usec / 周期×period? 无 period 信息，改以
     /// 被限流次数占周期次数比例表示（0..=1；除零安全）。
@@ -116,7 +119,7 @@ impl CgStats {
         }
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "cpu_stat": {
                 "nr_periods": self.cpu.nr_periods,
@@ -124,8 +127,8 @@ impl CgStats {
                 "throttled_usec": self.cpu.throttled_usec,
                 "throttled_ratio": round_ratio(self.throttle_ratio()),
             },
-            "memory_events": self.memory.as_ref().map(events_json),
-            "pids_events": self.pids.as_ref().map(events_json),
+            "memory_events": self.memory.map(events_json),
+            "pids_events": self.pids.map(events_json),
             "memory_current_bytes": self.memory_current_bytes,
             "pids_current": self.pids_current,
         })
@@ -138,6 +141,7 @@ fn round_ratio(v: f64) -> f64 {
 
 /// cpu.stat 计数器（#20）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct CpuStat {
     pub nr_periods: u64,
     pub nr_throttled: u64,
@@ -161,6 +165,7 @@ pub fn parse_cpu_stat(text: &str) -> CpuStat {
 
 /// memory.events / pids.events 计数器。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct EventsCounters {
     pub low: u64,
     pub high: u64,
@@ -170,6 +175,7 @@ pub struct EventsCounters {
 }
 
 /// 解析 events 文件；已知的五键取值，未知键忽略，全部缺省为 0（不 panic）。
+#[allow(dead_code)]
 pub fn parse_events_file(text: &str) -> EventsCounters {
     let mut out = EventsCounters::default();
     for line in text.lines() {
@@ -186,7 +192,7 @@ pub fn parse_events_file(text: &str) -> EventsCounters {
     out
 }
 
-fn events_json(e: &EventsCounters) -> serde_json::Value {
+fn events_json(e: EventsCounters) -> serde_json::Value {
     serde_json::json!({"low": e.low, "high": e.high, "max": e.max, "oom": e.oom, "oom_kill": e.oom_kill})
 }
 
@@ -387,6 +393,8 @@ impl CgroupManager {
 
     /// 分组内核统计（#20）：cpu.stat 节流、memory/pids events。
     /// 文件缺失返回 None（控制器未启用），解析失败按 0 兜底不 panic。
+    /// （供 GUI 分组卡片与 MCP 扩展查询;scheduler_groups 已走 GroupState.throttle）
+    #[allow(dead_code)]
     pub fn read_group_stats(&self, name: &str) -> Option<CgStats> {
         if !valid_group_name(name) {
             return None;

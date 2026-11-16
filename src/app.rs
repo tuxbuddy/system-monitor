@@ -175,8 +175,8 @@ enum UiJobOutcome {
     Remote(bool, String),
     /// 远端 cmdline 读取（缓存回填）。
     Cmdline(i32, String),
-    /// 远端进程详情。
-    Details(ProcUsage, ProcDetails),
+    /// 远端进程详情（大结构装箱，避免通道消息尺寸差异）。
+    Details(Box<(ProcUsage, ProcDetails)>),
     /// 远端分组列表刷新。
     Groups(Vec<cgroup::GroupState>),
     /// 委派根发现结果（写回 remote_cg_base 缓存）。
@@ -665,7 +665,7 @@ impl CpuManagerApp {
             match out {
                 UiJobOutcome::Report(r, msg) => self.report(r, msg),
                 UiJobOutcome::Cmdline(pid, c) => self.cmdline_cache = Some((pid, c)),
-                UiJobOutcome::Details(p, d) => self.details = Some((p, d)),
+                UiJobOutcome::Details(boxed) => self.details = Some(*boxed),
                 UiJobOutcome::Groups(g) => self.groups = g,
                 UiJobOutcome::BaseReady(host, base) => self.remote_cg_base = Some((host, base)),
                 UiJobOutcome::MovedIn(pid, orig) => {
@@ -828,7 +828,7 @@ impl CpuManagerApp {
                 let snapshot = p.clone();
                 self.spawn_job(move || {
                     let d = remote::read_details(&h, snapshot.pid).unwrap_or_default();
-                    UiJobOutcome::Details(snapshot, d)
+                    UiJobOutcome::Details(Box::new((snapshot, d)))
                 });
                 self.status_error = false;
                 self.status = format!("远端详情后台读取中：进程 {}", p.pid);
@@ -4144,7 +4144,7 @@ fn start_fleet_poller(
                 let key = target.as_str().to_string();
                 let fail_n = failures.get(&key).copied().unwrap_or(0);
                 // 退避：连续失败越多，探测越稀疏（每失败 ×1 轮跳过，上限 5 轮）
-                if fail_n > 0 && round % u64::from(fail_n.min(5) + 1) != 0 {
+                if fail_n > 0 && !round.is_multiple_of(u64::from(fail_n.min(5) + 1)) {
                     continue;
                 }
                 let _ = wtx.send(target);
