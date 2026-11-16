@@ -39,9 +39,13 @@ pub struct Cancel {
 }
 
 impl Cancel {
+    /// GUI/MCP 侧创建共享取消句柄（后续波次接线主机切换/退出取消；测试覆盖取消路径）。
+    #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
+    /// 触发协作式取消：所有持有该句柄的在途命令尽快返回。
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
@@ -112,6 +116,8 @@ fn truncate_tail(s: &str, max: usize) -> &str {
 #[derive(Debug)]
 pub struct ExecOutput {
     pub stdout: String,
+    /// 保留诊断信息：失败分类（auth/unreachable）依赖它
+    #[allow(dead_code)]
     pub stderr: String,
     /// 输出超过上限被截断（数据不完整，调用方需感知）。
     pub truncated: bool,
