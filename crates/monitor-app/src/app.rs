@@ -99,7 +99,7 @@ struct AutoRule {
     pct: Option<u32>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 struct SharedMetrics {
     cpu: f32,
     mem: f32,
@@ -273,6 +273,8 @@ pub struct CpuManagerApp {
     /// 后台远端操作通道（#15）：UI 提交，worker 回投结果，ui() 每帧轮询。
     job_tx: std::sync::mpsc::Sender<UiJobOutcome>,
     job_rx: std::sync::mpsc::Receiver<UiJobOutcome>,
+    /// /metrics 导出共享值（#26）。
+    metrics_shared: crate::metrics::SharedSample,
     /// 在途后台操作数（用于去重提示与状态展示）。
     pending_ops: u32,
 }
@@ -287,7 +289,11 @@ impl CpuManagerApp {
             Err(e) => (None, Some(e.to_string())),
         };
         let shared = Arc::new(Mutex::new(SharedMetrics::default()));
-        start_metrics_server(shared.clone());
+        let metrics_shared: crate::metrics::SharedSample = Arc::new(std::sync::Mutex::new(crate::metrics::MetricsSample::default()));
+        // 指标导出（#26）：Prometheus /metrics + JSON 兼容；绑定失败可见
+        if let Err(e) = crate::metrics::start(metrics_shared.clone(), "local".to_string()) {
+            eprintln!("system-monitor: {e}");
+        }
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         // 启动对账：上次崩溃/重启遗留的未完成限流，按策略精确恢复或提示
         let sched_note = match monitor_core::schedstate::load() {
@@ -419,6 +425,7 @@ impl CpuManagerApp {
             job_tx,
             job_rx,
             pending_ops: 0,
+            metrics_shared,
         };
         app.saved_cfg = app.current_config();
         if let Some(w) = hosts_warn {
@@ -452,18 +459,34 @@ impl CpuManagerApp {
             .mem
             .map(|m| if m.total_kb == 0 { 0.0 } else { m.used_kb() as f32 / m.total_kb as f32 * 100.0 })
             .unwrap_or(0.0);
+        let sm = SharedMetrics {
+            cpu: self.usage.total_percent,
+            mem: mem_pct_now,
+            temp: self.pi.temp_c.unwrap_or(0.0),
+            power: self.pi.power.map(|p| p.core_w).unwrap_or(0.0),
+            gpu: self.pi.gpu.v3d_ghz.unwrap_or(0.0),
+            disk_r: self.usage.disk_read_bps / 1024.0,
+            disk_w: self.usage.disk_write_bps / 1024.0,
+            net_rx: self.usage.net_rx_bps / 1024.0,
+            net_tx: self.usage.net_tx_bps / 1024.0,
+            procs: self.usage.procs.len(),
+        };
         if let Ok(mut m) = self.shared.lock() {
-            *m = SharedMetrics {
-                cpu: self.usage.total_percent,
-                mem: mem_pct_now,
-                temp: self.pi.temp_c.unwrap_or(0.0),
-                power: self.pi.power.map(|p| p.core_w).unwrap_or(0.0),
-                gpu: self.pi.gpu.v3d_ghz.unwrap_or(0.0),
-                disk_r: self.usage.disk_read_bps / 1024.0,
-                disk_w: self.usage.disk_write_bps / 1024.0,
-                net_rx: self.usage.net_rx_bps / 1024.0,
-                net_tx: self.usage.net_tx_bps / 1024.0,
-                procs: self.usage.procs.len(),
+            *m = sm;
+        }
+        // 同步到 /metrics 导出（#26）
+        if let Ok(mut mx) = self.metrics_shared.lock() {
+            *mx = crate::metrics::MetricsSample {
+                cpu: sm.cpu,
+                mem: sm.mem,
+                temp: sm.temp,
+                power: sm.power,
+                gpu_ghz: sm.gpu,
+                disk_read_kbps: sm.disk_r,
+                disk_write_kbps: sm.disk_w,
+                net_rx_kbps: sm.net_rx,
+                net_tx_kbps: sm.net_tx,
+                procs: sm.procs as u64,
             };
         }
         self.filesystems = read_filesystems();
@@ -612,18 +635,34 @@ impl CpuManagerApp {
             .mem
             .map(|m| if m.total_kb == 0 { 0.0 } else { m.used_kb() as f32 / m.total_kb as f32 * 100.0 })
             .unwrap_or(0.0);
+        let sm = SharedMetrics {
+            cpu: self.usage.total_percent,
+            mem: mem_pct_now,
+            temp: self.pi.temp_c.unwrap_or(0.0),
+            power: self.pi.power.map(|p| p.core_w).unwrap_or(0.0),
+            gpu: self.pi.gpu.v3d_ghz.unwrap_or(0.0),
+            disk_r: self.usage.disk_read_bps / 1024.0,
+            disk_w: self.usage.disk_write_bps / 1024.0,
+            net_rx: self.usage.net_rx_bps / 1024.0,
+            net_tx: self.usage.net_tx_bps / 1024.0,
+            procs: self.usage.procs.len(),
+        };
         if let Ok(mut m) = self.shared.lock() {
-            *m = SharedMetrics {
-                cpu: self.usage.total_percent,
-                mem: mem_pct_now,
-                temp: self.pi.temp_c.unwrap_or(0.0),
-                power: self.pi.power.map(|p| p.core_w).unwrap_or(0.0),
-                gpu: self.pi.gpu.v3d_ghz.unwrap_or(0.0),
-                disk_r: self.usage.disk_read_bps / 1024.0,
-                disk_w: self.usage.disk_write_bps / 1024.0,
-                net_rx: self.usage.net_rx_bps / 1024.0,
-                net_tx: self.usage.net_tx_bps / 1024.0,
-                procs: self.usage.procs.len(),
+            *m = sm;
+        }
+        // 同步到 /metrics 导出（#26）
+        if let Ok(mut mx) = self.metrics_shared.lock() {
+            *mx = crate::metrics::MetricsSample {
+                cpu: sm.cpu,
+                mem: sm.mem,
+                temp: sm.temp,
+                power: sm.power,
+                gpu_ghz: sm.gpu,
+                disk_read_kbps: sm.disk_r,
+                disk_write_kbps: sm.disk_w,
+                net_rx_kbps: sm.net_rx,
+                net_tx_kbps: sm.net_tx,
+                procs: sm.procs as u64,
             };
         }
     }
@@ -1301,11 +1340,15 @@ impl CpuManagerApp {
             }
             return;
         }
+        // PSI 输入（#28）：本地读取 /proc/pressure（不存在则 None）
+        let psi = monitor_core::psi::read_local();
         let snap = SchedSnapshot {
             temp_c: self.pi.temp_c,
             cpu_percent: self.usage.total_percent,
             throttled: self.pi.throttle.is_some_and(|t| t.any_current()),
             undervoltage: self.pi.throttle.is_some_and(|t| t.undervoltage),
+            psi_cpu_some10: psi.cpu.map(|r| r.some.avg10),
+            psi_io_some10: psi.io.map(|r| r.some.avg10),
         };
         let now = Instant::now();
         // evaluate 为纯函数；状态只在执行器确认写入成功后 commit
@@ -4192,30 +4235,6 @@ fn start_fleet_poller(
     });
 }
 
-fn start_metrics_server(shared: Arc<Mutex<SharedMetrics>>) {
-    std::thread::spawn(move || {
-        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:9876") else {
-            return;
-        };
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else {
-                continue;
-            };
-            let m = shared.lock().map(|m| m.clone()).unwrap_or_default();
-            let json = format!(
-                "{{\"cpu\":{:.1},\"mem\":{:.1},\"temp\":{:.1},\"power\":{:.2},\"gpu_ghz\":{:.2},\"disk_read_kbps\":{:.1},\"disk_write_kbps\":{:.1},\"net_rx_kbps\":{:.1},\"net_tx_kbps\":{:.1},\"procs\":{}}}",
-                m.cpu, m.mem, m.temp, m.power, m.gpu, m.disk_r, m.disk_w, m.net_rx, m.net_tx, m.procs
-            );
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                json.len(),
-                json
-            );
-            use std::io::Write;
-            let _ = s.write_all(resp.as_bytes());
-        }
-    });
-}
 
 fn history_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/system-monitor/history.csv"))

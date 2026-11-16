@@ -105,6 +105,11 @@ fn base_risk(tool: &str) -> RiskLevel {
         "process_nice" | "scheduler_set_limit" | "probe_attach" | "probe_detach" => RiskLevel::L2,
         // L3 / 参数敏感
         "process_signal" | "scheduler_group_action" => RiskLevel::L2, // 具体看 risk_of
+        // 诊断会话簿记工具(真正的动作执行经 dispatcher 单独裁决)
+        "ebpf_doctor" | "diag_start" | "diag_add_evidence" | "diag_submit_plan" | "diag_approve" | "diag_status" => RiskLevel::L1,
+        // diag_execute 的实际风险由其 plan 命令决定(经 dispatcher 裁决);簿记层 L1
+        "diag_execute" => RiskLevel::L1,
+        "diag_verify" => RiskLevel::L1,
         // 元工具
         "policy_status" => RiskLevel::L0,
         other => {

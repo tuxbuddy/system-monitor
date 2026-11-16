@@ -4,6 +4,7 @@ members = [
     "crates/monitor-core",
     "crates/monitor-linux",
     "crates/monitor-remote",
+    "crates/monitor-agent",
     "apps/monitor",
 ]
 

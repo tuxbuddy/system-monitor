@@ -1,0 +1,10 @@
+[package]
+name = "monitor-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "受管 Agent PoC：类型化任务、本地策略门、心跳与离线队列、吊销注册表（#29）"
+
+[dependencies]
+monitor-core = { path = "../monitor-core" }
+serde_json = { workspace = true }
