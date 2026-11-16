@@ -476,14 +476,18 @@ mod tests {
 
     #[test]
     fn confirm_allows_l2_but_l3_needs_ticket() {
-        assert!(matches!(check(PolicyMode::Confirm, "process_nice", &json!({"pid": 42, "nice": 5}), None), Decision::Allow));
-        let a = args(42, "KILL", false);
-        assert!(matches!(check(PolicyMode::Confirm, "process_signal", &a, None), Decision::NeedTicket { .. }));
-        // 假 token 拒绝
-        match check(PolicyMode::Confirm, "process_signal", &a, Some("v1.0000.1")) {
-            Decision::Deny { error, .. } => assert!(error.contains("审批失败")),
-            other => panic!("假 token 应拒绝，实际 {other:?}"),
-        }
+        // consume_approval 触碰密钥文件 → 与其它密钥测试串行 + 隔离 HOME
+        // （env 是进程级的:不隔离会与 approval_ticket 测试互相覆盖密钥）
+        isolated(|| {
+            assert!(matches!(check(PolicyMode::Confirm, "process_nice", &json!({"pid": 42, "nice": 5}), None), Decision::Allow));
+            let a = args(42, "KILL", false);
+            assert!(matches!(check(PolicyMode::Confirm, "process_signal", &a, None), Decision::NeedTicket { .. }));
+            // 假 token 拒绝
+            match check(PolicyMode::Confirm, "process_signal", &a, Some("v1.0000.1")) {
+                Decision::Deny { error, .. } => assert!(error.contains("审批失败")),
+                other => panic!("假 token 应拒绝，实际 {other:?}"),
+            }
+        });
     }
 
     #[test]
