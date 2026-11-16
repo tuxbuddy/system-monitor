@@ -112,3 +112,10 @@ cargo test --no-default-features --bin system-monitor   # 纯 TUI 版
 - `2026-11-11-cpu-manager-v2-design.md` — 内存监控与历史曲线
 - `2026-11-11-cpu-manager-v3-design.md` — 能效 / 供电与平台档案
 - `2026-11-12-scheduler-center-design.md` — v4 调度中心、探针与远程主机
+
+## 许可证与安全
+
+- 许可证：[MIT](LICENSE)。
+- 安全问题请勿公开提 issue，参见 [SECURITY.md](SECURITY.md) 的私下报告渠道与响应时限。
+- MCP 服务默认只读；写操作需 `--mcp-policy=confirm|trusted`，L3 动作需一次性审批凭证（`system-monitor mcp-approve`）。全部写操作（含被拒绝的）记录于 `~/.local/share/system-monitor/mcp-audit.jsonl`。
+- 发布产物附 sha256 校验和；CI 通过 `cargo-audit`（RUSTSEC 漏洞）与 `cargo-deny`（许可证/重复依赖）门禁。

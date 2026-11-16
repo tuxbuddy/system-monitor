@@ -13,6 +13,23 @@ env:
   GUI_APT: libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev pkg-config
 
 jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 依赖漏洞告警（RUSTSEC）。审计失败阻断 release 构建（build needs audit）。
+      - name: cargo-audit（依赖漏洞）
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
+      # 许可证/重复依赖治理：许可证冲突与未知 license 直接失败
+      - name: cargo-deny（许可证与依赖）
+        run: |
+          cargo install cargo-deny --locked || true
+          cargo deny check licenses bans
+
   test:
     runs-on: ubuntu-24.04
     steps:
@@ -54,7 +71,7 @@ jobs:
         run: cargo test --no-default-features --bin system-monitor
 
   build:
-    needs: test
+    needs: [test, audit]
     strategy:
       fail-fast: false
       matrix:

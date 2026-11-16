@@ -2,6 +2,9 @@
 name = "system-monitor"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Linux 系统诊断与控制工具：本地/远端采集、cgroup 调度、内核探针、MCP 服务"
+repository = "https://github.com/tuxbuddy/system-monitor"
 
 [features]
 default = ["gui"]

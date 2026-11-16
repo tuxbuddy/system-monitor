@@ -345,6 +345,26 @@ impl Server {
                 }
                 Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "pid": pid, "nice": nice}))
             }
+            "host_capabilities" => {
+                let host = args.get("host").and_then(|v| v.as_str());
+                match host {
+                    None | Some("local") | Some("") => {
+                        let caps = crate::caps::detect_local();
+                        let mut v = caps.to_json();
+                        v["host"] = json!("local");
+                        Ok(v)
+                    }
+                    Some(h) => {
+                        let target = remote::SshTarget::parse(h).map_err(|e| format!("host 参数非法：{e}"))?;
+                        let script = crate::caps::capabilities_script();
+                        let out = remote::ssh_exec(&target, &script, &remote::ExecLimits::default(), None)
+                            .map_err(|e| format!("远端能力采集失败：{e}"))?;
+                        let mut v = crate::caps::parse_report(&out.stdout).to_json();
+                        v["host"] = json!(h);
+                        Ok(v)
+                    }
+                }
+            }
             "scheduler_status" => {
                 // cgroup 调度体检：逐步报告委派/控制器/可写性，失败给修复建议
                 let checks = crate::cgroup::doctor();
@@ -775,6 +795,12 @@ fn tools() -> Vec<Value> {
             "scheduler_status",
             "本机 cgroup 调度体检：cgroup v2 / 委派 / 控制器 / 可写性逐项报告，失败附原因与修复建议。",
             json!({}),
+            &[],
+        ),
+        tool(
+            "host_capabilities",
+            "主机真实能力报告：cgroup v2/委派/控制器、PSI、BTF、tracefs、systemd、thermal、cpufreq、RAPL、探针工具。host 可选（默认本机，远端经 SSH 一次性采集）。",
+            json!({"host": {"type": "string"}}),
             &[],
         ),
         tool(

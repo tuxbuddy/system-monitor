@@ -3,6 +3,7 @@
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod actions;
+mod caps;
 mod cgroup;
 mod config;
 mod fsutil;
