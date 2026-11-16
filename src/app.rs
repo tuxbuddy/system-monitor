@@ -1046,7 +1046,10 @@ impl CpuManagerApp {
             if !self.sched_halt_warned {
                 self.sched_halt_warned = true;
                 self.status_error = true;
-                self.status = "自动调度已熔断：连续写入失败，已停止自动动作（可重新启用自动调度以重试）".to_string();
+                self.status = format!(
+                    "自动调度已熔断：连续 {} 次写入失败，已停止自动动作（可重新启用自动调度以重试）",
+                    self.sched_state.consecutive_failures()
+                );
             }
             return;
         }
