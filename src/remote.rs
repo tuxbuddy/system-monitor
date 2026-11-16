@@ -440,6 +440,20 @@ pub struct RemoteSlot {
     pub generation: u64,
     pub sample: Option<RemoteSample>,
     pub sampled_at: Option<Instant>,
+    /// 最近一次采集失败的原因（成功后清除）。失败时保留旧样本但标记 stale。
+    pub last_error: Option<String>,
+}
+
+/// 带新鲜度标记的样本视图：过期数据显式声明，不冒充实时值。
+#[derive(Clone)]
+pub struct FreshSample {
+    pub sample: RemoteSample,
+    /// 距上次成功采样的秒数。
+    pub age_secs: f32,
+    /// 超过 stale_after_secs 视为过期。
+    pub stale: bool,
+    /// 最近一次采集失败原因（成功采样后清除）。
+    pub last_error: Option<String>,
 }
 
 impl RemoteSlot {
@@ -454,16 +468,29 @@ impl RemoteSlot {
         self.generation += 1;
         self.sample = None;
         self.sampled_at = None;
+        self.last_error = None;
         self.generation
     }
 
     /// 采样线程回写：host 与 generation 都匹配才接受，过期写入返回 false 丢弃。
+    /// 成功写入同时清除失败标记。
     pub fn accept(&mut self, host: &str, generation: u64, sample: RemoteSample) -> bool {
         if self.host != host || self.generation != generation {
             return false;
         }
         self.sample = Some(sample);
         self.sampled_at = Some(Instant::now());
+        self.last_error = None;
+        true
+    }
+
+    /// 采集失败：保留旧样本，仅记录失败原因（host 匹配才记，过期线程的失败
+    /// 不污染新主机）。
+    pub fn record_failure(&mut self, host: &str, err: impl Into<String>) -> bool {
+        if self.host != host {
+            return false;
+        }
+        self.last_error = Some(err.into());
         true
     }
 
@@ -474,6 +501,25 @@ impl RemoteSlot {
         } else {
             None
         }
+    }
+
+    /// 带新鲜度的消费端读取。超过 `stale_after_secs`（建议 3 个采样周期）的
+    /// 旧样本显式标记 stale；采集失败但旧数据仍在时同样标记。
+    pub fn current_fresh(&self, host: &str, stale_after_secs: f32) -> Option<FreshSample> {
+        if self.host != host {
+            return None;
+        }
+        let sample = self.sample.as_ref()?;
+        let age = self
+            .sampled_at
+            .map(|t| t.elapsed().as_secs_f32())
+            .unwrap_or(f32::INFINITY);
+        Some(FreshSample {
+            sample: sample.clone(),
+            age_secs: age,
+            stale: age > stale_after_secs || self.last_error.is_some(),
+            last_error: self.last_error.clone(),
+        })
     }
 }
 
@@ -564,11 +610,17 @@ pub fn parse_output(text: &str, prev: &mut Option<Counters>) -> Option<RemoteSam
 
 /// 通过 SSH 拉取一次（只读）。target 必须是已校验的 `SshTarget`。
 pub fn collect(target: &SshTarget, prev: &mut Option<Counters>) -> Option<RemoteSample> {
-    let out = ssh_exec(target, SCRIPT, &ExecLimits::default(), None).ok()?;
+    collect_result(target, prev).ok()
+}
+
+/// collect 的结构化版本：失败原因可记录到采样槽（新鲜度/错误展示）。
+pub fn collect_result(target: &SshTarget, prev: &mut Option<Counters>) -> Result<RemoteSample, String> {
+    let out = ssh_exec(target, SCRIPT, &ExecLimits::default(), None).map_err(|e| e.to_string())?;
     if out.truncated {
-        return None; // 输出不完整，宁可不更新也不能拿半截数据冒充采样
+        // 输出不完整，宁可不更新也不能拿半截数据冒充采样
+        return Err(format!("远端输出超过 {} 字节上限，已截断", ExecLimits::default().max_output));
     }
-    parse_output(&out.stdout, prev)
+    parse_output(&out.stdout, prev).ok_or_else(|| "远端输出解析失败（脚本或系统版本不兼容？）".to_string())
 }
 
 /// 单主机摘要（供总览页并排展示）。
@@ -721,15 +773,65 @@ pub fn cg_base(target: &SshTarget) -> Option<String> {
     ok.then_some(base)
 }
 
+/// 远端 cgroup 就绪结果：目录/控制器/可写性分别校验，失败有可区分错误码。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CgReady {
+    pub ok: bool,
+    /// 读回验证后的控制器列表（如 ["cpu","pids"]）
+    pub controllers: Vec<String>,
+    /// 失败码：10 目录创建失败 / 20 subtree_control 写失败 / 21 cpu 未启用 /
+    /// 22 pids 未启用 / 30 cpu.max 不可写 / 31 pids.max 不可写 / 99 通讯失败
+    pub error_code: Option<u32>,
+    pub detail: String,
+}
+
+impl CgReady {
+    fn from_output(text: &str) -> Self {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("READY|") {
+                let controllers = rest.split_whitespace().map(String::from).collect();
+                return Self { ok: true, controllers, error_code: None, detail: "cpu/pids 已启用且目标文件可写".to_string() };
+            }
+            if let Some(rest) = line.strip_prefix("ERR|") {
+                let mut f = rest.splitn(2, '|');
+                let code = f.next().and_then(|c| c.parse().ok());
+                let detail = f.next().unwrap_or("未知失败").to_string();
+                return Self { ok: false, controllers: Vec::new(), error_code: code, detail };
+            }
+        }
+        Self { ok: false, controllers: Vec::new(), error_code: Some(99), detail: "远端无结构化输出（连接或 shell 失败）".to_string() }
+    }
+}
+
 /// 建并准备容器 cm-sched（+cpu +pids）。
-pub fn cg_ensure(target: &SshTarget, base: &str) -> bool {
+///
+/// 每步 `|| exit N`，最后读回 `cgroup.subtree_control` 并验证目标文件可写——
+/// 不再无条件 echo READY 造成假阳性。失败码经 [`CgReady`] 返回给 UI/MCP 展示。
+pub fn cg_ensure(target: &SshTarget, base: &str) -> CgReady {
     let c = format!("{base}/cm-sched");
-    ssh_sh(
-        target,
-        &format!("mkdir -p '{c}' && printf '+cpu +pids' > '{c}/cgroup.subtree_control' 2>/dev/null; echo READY"),
-    )
-    .map(|s| s.contains("READY"))
-    .unwrap_or(false)
+    let script = format!(
+        r#"c='{c}'
+mkdir -p "$c" || {{ echo "ERR|10|目录创建失败（权限或路径）"; exit 0; }}
+printf '+cpu +pids' > "$c/cgroup.subtree_control" || {{ echo "ERR|20|subtree_control 写入失败（systemd 未委派？）"; exit 0; }}
+ctrls=$(cat "$c/cgroup.subtree_control" 2>/dev/null)
+case "$ctrls" in *cpu*) ;; *) echo "ERR|21|cpu 未在读回的 subtree_control 中"; exit 0;; esac
+case "$ctrls" in *pids*) ;; *) echo "ERR|22|pids 未在读回的 subtree_control 中"; exit 0;; esac
+[ -e "$c/cpu.max" ] || {{ echo "ERR|30|cpu.max 不存在（cgroup v1？）"; exit 0; }}
+[ -w "$c/cpu.max" ] || {{ echo "ERR|30|cpu.max 不可写"; exit 0; }}
+[ -e "$c/pids.max" ] || {{ echo "ERR|31|pids.max 不存在"; exit 0; }}
+[ -w "$c/pids.max" ] || {{ echo "ERR|31|pids.max 不可写"; exit 0; }}
+echo "READY|$ctrls"
+"#
+    );
+    match ssh_exec(target, &script, &ExecLimits::default(), None) {
+        Ok(out) => CgReady::from_output(&out.stdout),
+        Err(e) => CgReady {
+            ok: false,
+            controllers: Vec::new(),
+            error_code: Some(99),
+            detail: e.to_string(),
+        },
+    }
 }
 
 fn parse_group_lines(text: &str) -> Vec<GroupState> {
@@ -1061,6 +1163,30 @@ mod tests {
     }
 
     #[test]
+    fn freshness_tracks_failure_stale_recovery() {
+        let mut slot = RemoteSlot::new();
+        let g = slot.reset_for("h1");
+        // 尚无样本:无视图
+        assert!(slot.current_fresh("h1", 6.0).is_none());
+        assert!(slot.accept("h1", g, dummy_sample(100)));
+        // 失败:旧样本保留但标记 stale + 错误
+        assert!(slot.record_failure("h1", "ssh timeout"));
+        let fresh = slot.current_fresh("h1", 6.0).unwrap();
+        assert!(fresh.stale);
+        assert_eq!(fresh.last_error.as_deref(), Some("ssh timeout"));
+        assert!(fresh.sample.usage.procs.len() == 2, "失败不得清空旧数据");
+        // 恢复:标记清除
+        assert!(slot.accept("h1", g, dummy_sample(150)));
+        let fresh = slot.current_fresh("h1", 6.0).unwrap();
+        assert!(!fresh.stale);
+        assert!(fresh.last_error.is_none());
+        // 旧代次线程的失败不记录
+        slot.reset_for("h2");
+        assert!(!slot.record_failure("h1", "stale thread error"));
+        assert!(slot.last_error.is_none());
+    }
+
+    #[test]
     fn rapid_host_switching_never_pollutes() {
         // 并发场景：后台线程持旧代次凭证延迟回写，同时 UI 快速来回切换
         let slot = std::sync::Arc::new(std::sync::Mutex::new(RemoteSlot::new()));
@@ -1082,6 +1208,22 @@ mod tests {
         let guard = slot.lock().unwrap();
         assert_eq!(guard.generation, g2);
         assert!(guard.sample.is_none(), "h1 旧线程不得污染 h2");
+    }
+
+    #[test]
+    fn cg_ready_parses_success_and_error_codes() {
+        let ok = CgReady::from_output("noise\nREADY|cpu pids\n");
+        assert!(ok.ok);
+        assert_eq!(ok.controllers, vec!["cpu", "pids"]);
+        assert_eq!(ok.error_code, None);
+        let e20 = CgReady::from_output("ERR|20|subtree_control 写入失败（systemd 未委派？）\n");
+        assert!(!e20.ok);
+        assert_eq!(e20.error_code, Some(20));
+        assert!(e20.detail.contains("委派"));
+        // 无结构化输出 = 通讯/兼容失败,绝不算成功(假阳性防线)
+        let bad = CgReady::from_output("READY\nsomething else\n");
+        assert!(!bad.ok);
+        assert_eq!(bad.error_code, Some(99));
     }
 
     #[test]

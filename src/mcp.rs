@@ -22,11 +22,19 @@ struct View {
     filesystems: Vec<FsUsage>,
     conns: Vec<NetConn>,
     label: String,
+    /// 采样距今秒数（本地近似 0）。
+    age_secs: u64,
+    /// 采集失败后返回旧数据时为 true。
+    stale: bool,
+    /// 最近一次采集失败原因。
+    last_error: Option<String>,
 }
 
 pub struct Server {
     current: Option<remote::SshTarget>,
     hosts: Vec<remote::SshTarget>,
+    /// 每主机最近一次成功采样时刻与失败原因（新鲜度元数据）。
+    remote_fresh: HashMap<String, (Option<Instant>, Option<String>)>,
     /// 服务端强制策略：默认 readonly，禁止隐式升级。
     policy: PolicyMode,
     caller: String,
@@ -43,6 +51,7 @@ impl Server {
             hosts: remote::load_hosts().0,
             policy: PolicyMode::Readonly,
             caller: std::env::var("SM_MCP_CALLER").unwrap_or_else(|_| "stdio".to_string()),
+            remote_fresh: HashMap::new(),
             sampler: Sampler::new(),
             last_local: Instant::now() - Duration::from_secs(10),
             remote_prev: HashMap::new(),
@@ -81,27 +90,46 @@ impl Server {
                     filesystems: procstats::read_filesystems(),
                     conns: procstats::read_net_conns(),
                     label: "本地".to_string(),
+                    age_secs: 0,
+                    stale: false,
+                    last_error: None,
                 })
             }
             Some(h) => {
                 let key = h.as_str().to_string();
                 let mut prev = self.remote_prev.remove(&key).flatten();
                 let first = prev.is_none();
-                let mut sample = remote::collect(h, &mut prev).ok_or_else(|| format!("无法连接远端主机：{key}"))?;
-                if first {
+                let mut sample = remote::collect_result(h, &mut prev);
+                if first && sample.is_err() {
                     std::thread::sleep(Duration::from_millis(120));
-                    if let Some(again) = remote::collect(h, &mut prev) {
-                        sample = again;
+                    sample = remote::collect_result(h, &mut prev);
+                }
+                self.remote_prev.insert(key.clone(), prev);
+                match sample {
+                    Ok(s) => {
+                        self.remote_fresh.insert(key.clone(), (Some(Instant::now()), None));
+                        Ok(View {
+                            usage: s.usage,
+                            pi: s.pi,
+                            filesystems: s.filesystems,
+                            conns: s.conns,
+                            label: h.as_str().to_string(),
+                            age_secs: 0,
+                            stale: false,
+                            last_error: None,
+                        })
+                    }
+                    Err(e) => {
+                        // 失败：记录错误；若此前有成功样本，带 stale 标记返回旧数据
+                        self.remote_fresh.insert(key.clone(), (None, Some(e.clone())));
+                        let (last_at, _) = self.remote_fresh.get(&key).cloned().unwrap_or((None, None));
+                        let age = last_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        // 无历史数据时向上报错;有历史时调用方可继续用 overview_json 的 stale 标记
+                        Err(format!(
+                            "{{\"error\":\"collect_failed\",\"host\":\"{key}\",\"message\":\"{e}\",\"stale\":true,\"last_ok_age_secs\":{age}}}"
+                        ))
                     }
                 }
-                self.remote_prev.insert(key, prev);
-                Ok(View {
-                    usage: sample.usage,
-                    pi: sample.pi,
-                    filesystems: sample.filesystems,
-                    conns: sample.conns,
-                    label: h.as_str().to_string(),
-                })
             }
         }
     }
@@ -222,6 +250,7 @@ impl Server {
                     "uptime_secs": v.usage.uptime_secs,
                     "process_count": v.usage.procs.len(),
                     "cpu_percent": round1(v.usage.total_percent),
+                    "freshness": freshness_json(&v),
                 }))
             }
             "process_list" => {
@@ -412,13 +441,26 @@ impl Server {
                     }
                     Some(h) => {
                         let base = remote::cg_base(h).ok_or_else(|| "该主机没有可写的用户 cgroup 委派根".to_string())?;
-                        let ok = match action {
-                            "create" => remote::cg_create(h, &base, &name) && remote::cg_ensure(h, &base),
-                            "delete" => remote::cg_delete(h, &base, &name),
+                        match action {
+                            "create" => {
+                                if !remote::cg_create(h, &base, &name) {
+                                    return Err("远端创建失败（名称冲突或权限不足）".to_string());
+                                }
+                                let ready = remote::cg_ensure(h, &base);
+                                if !ready.ok {
+                                    return Err(format!(
+                                        "远端调度容器未就绪（码 {:?}）：{}",
+                                        ready.error_code.unwrap_or(99),
+                                        ready.detail
+                                    ));
+                                }
+                            }
+                            "delete" => {
+                                if !remote::cg_delete(h, &base, &name) {
+                                    return Err("远端删除失败（组内仍有进程或权限不足）".to_string());
+                                }
+                            }
                             other => return Err(format!("未知 action：{other}")),
-                        };
-                        if !ok {
-                            return Err(format!("远端 {action} 失败（名称冲突或权限不足）"));
                         }
                     }
                 }
@@ -566,6 +608,14 @@ fn round2(v: f32) -> f64 {
     (f64::from(v) * 100.0).round() / 100.0
 }
 
+fn freshness_json(v: &View) -> Value {
+    json!({
+        "sampled_age_secs": v.age_secs,
+        "stale": v.stale,
+        "last_error": v.last_error,
+    })
+}
+
 fn overview_json(v: &View) -> Value {
     let mem = v.usage.mem.map(|m| {
         json!({
@@ -605,6 +655,7 @@ fn overview_json(v: &View) -> Value {
         "process_count": v.usage.procs.len(),
         "filesystems": v.filesystems.len(),
         "connections": v.conns.len(),
+        "freshness": freshness_json(v),
     })
 }
 

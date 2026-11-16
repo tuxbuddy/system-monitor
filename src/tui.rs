@@ -162,23 +162,33 @@ impl App {
             }
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
-                let res = remote::collect(&t, &mut p);
+                let res = remote::collect_result(&t, &mut p);
                 if let Ok(mut g) = prev.lock() {
                     *g = p;
                 }
-                if let Some(sample) = res
-                    && let Ok(mut s) = shared.lock()
-                {
-                    s.accept(&kick_key, ticket, sample);
+                if let Ok(mut s) = shared.lock() {
+                    match res {
+                        Ok(sample) => {
+                            s.accept(&kick_key, ticket, sample);
+                        }
+                        Err(e) => {
+                            s.record_failure(&kick_key, e);
+                        }
+                    }
                 }
                 busy.store(false, Ordering::Relaxed);
             });
         }
-        if let Some(s) = self.shared.lock().ok().and_then(|g| g.current(&key).cloned()) {
-            self.usage = s.usage;
-            self.pi = s.pi;
+        if let Some(f) = self.shared.lock().ok().and_then(|g| g.current_fresh(&key, self.interval.as_secs_f32() * 3.0)) {
+            self.usage = f.sample.usage;
+            self.pi = f.sample.pi;
             self.last = Instant::now();
             self.push_hist();
+            if let Some(err) = &f.last_error {
+                self.err(format!("采集失败（显示 {} 前数据）：{}", f.age_secs as u32, err));
+            } else if f.stale {
+                self.err(format!("数据已过期（{} 秒前采样）", f.age_secs as u32));
+            }
         }
     }
 

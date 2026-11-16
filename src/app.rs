@@ -265,6 +265,38 @@ impl CpuManagerApp {
         };
         let shared = Arc::new(Mutex::new(SharedMetrics::default()));
         start_metrics_server(shared.clone());
+        // 启动对账：上次崩溃/重启遗留的未完成限流，按策略精确恢复或提示
+        let sched_note = match crate::schedstate::load() {
+            Some(action) => {
+                let host_of_action = action.host.clone();
+                let group = action.group.clone();
+                match mgr.as_ref().map(|m| m.read_cpu_max(&group)) {
+                    Some(cur) => match crate::schedstate::reconcile(&action, cur.as_deref(), &host_of_action) {
+                        crate::schedstate::Reconcile::RestoreTo(prev) => {
+                            let res = mgr.as_ref().map(|m| m.set_cpu_max_raw(&group, &prev));
+                            match res {
+                                Some(Ok(())) => {
+                                    crate::schedstate::clear();
+                                    Some((false, format!("已恢复分组 {group} 的限流前状态（{prev}）")))
+                                }
+                                Some(Err(e)) => Some((true, format!("启动恢复分组 {group} 失败：{e}"))),
+                                None => None,
+                            }
+                        }
+                        crate::schedstate::Reconcile::ExternalChange { current } => Some((
+                            true,
+                            format!(
+                                "分组 {group} 的 cpu.max 已被外部修改为「{current}」，不自动覆盖；可手动解除"
+                            ),
+                        )),
+                        crate::schedstate::Reconcile::Skipped { reason } => Some((true, format!("遗留限流记录跳过：{reason}"))),
+                        crate::schedstate::Reconcile::Noop => None,
+                    },
+                    None => Some((true, format!("遗留限流记录：分组 {group} 无法读取，请人工确认"))),
+                }
+            }
+            None => None,
+        };
         let (hosts, hosts_errors) = remote::load_hosts();
         let hosts_warn = if hosts_errors.is_empty() {
             None
@@ -366,6 +398,10 @@ impl CpuManagerApp {
         if let Some(w) = hosts_warn {
             app.status_error = true;
             app.status = w;
+        }
+        if let Some((err, msg)) = sched_note {
+            app.status_error = err;
+            app.status = msg;
         }
         load_history_into(&mut app.perf);
         app.resample();
@@ -497,32 +533,44 @@ impl CpuManagerApp {
             let kick_key = key.clone();
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
-                let res = remote::collect(&t, &mut p);
+                let res = remote::collect_result(&t, &mut p);
                 if let Ok(mut g) = prev.lock() {
                     *g = p;
                 }
-                // 校验 host+generation 后写入；主机已切换则丢弃
-                if let Some(sample) = res
-                    && let Ok(mut s) = shared.lock()
-                {
-                    s.accept(&kick_key, ticket, sample);
+                // 校验 host+generation 后写入；主机已切换则丢弃（含失败记录）
+                if let Ok(mut s) = shared.lock() {
+                    match res {
+                        Ok(sample) => {
+                            s.accept(&kick_key, ticket, sample);
+                        }
+                        Err(e) => {
+                            s.record_failure(&kick_key, e);
+                        }
+                    }
                 }
                 if let Ok(mut f) = inflight.lock() {
                     *f = false;
                 }
             });
         }
-        let sample = self
+        let fresh = self
             .remote_shared
             .lock()
             .ok()
-            .and_then(|s| s.current(&key).cloned());
-        if let Some(s) = sample {
-            self.usage = s.usage;
-            self.pi = s.pi;
-            self.filesystems = s.filesystems;
-            self.net_conns = s.conns;
+            .and_then(|s| s.current_fresh(&key, 6.0)); // 3×2s 采样周期视为过期
+        if let Some(f) = fresh {
+            self.usage = f.sample.usage;
+            self.pi = f.sample.pi;
+            self.filesystems = f.sample.filesystems;
+            self.net_conns = f.sample.conns;
             self.perf.record(&self.usage, &self.pi);
+            if let Some(err) = &f.last_error {
+                self.status_error = true;
+                self.status = format!("远端采集失败（显示 {} 前的数据）：{}", format_age(f.age_secs), err);
+            } else if f.stale {
+                self.status_error = true;
+                self.status = format!("数据已过期（{} 前采样），正在重试…", format_age(f.age_secs));
+            }
         } else {
             self.filesystems.clear();
             self.net_conns.clear();
@@ -689,7 +737,16 @@ impl CpuManagerApp {
             return Some(b.clone());
         }
         let base = remote::cg_base(host)?;
-        remote::cg_ensure(host, &base);
+        let ready = remote::cg_ensure(host, &base);
+        if !ready.ok {
+            self.status_error = true;
+            self.status = format!(
+                "远端调度容器未就绪（码 {:?}）：{}",
+                ready.error_code.unwrap_or(99),
+                ready.detail
+            );
+            return None;
+        }
         self.remote_cg_base = Some((host.as_str().to_string(), base.clone()));
         Some(base)
     }
@@ -1068,9 +1125,31 @@ impl CpuManagerApp {
                 SchedAction::Restore { group } => format!("自动恢复：分组 {group} 解除限速"),
             };
             let committed = a.clone();
+            // 限流前先读原值，成功后持久化 AppliedAction（崩溃可精确回滚）
+            let prev = match &committed {
+                SchedAction::Engage { group, .. } => self.mgr.as_ref().and_then(|m| m.read_cpu_max(group)),
+                SchedAction::Restore { .. } => None,
+            };
             let ok = self.apply_sched_action(a);
             self.sched_state.commit(&committed, ok, Instant::now());
             if ok {
+                match &committed {
+                    SchedAction::Engage { group, pct } => {
+                        if let Some(prev) = prev {
+                            let act = crate::schedstate::AppliedAction::now(
+                                "local",
+                                group,
+                                crate::schedstate::normalize_cpu_max(&prev),
+                                Some(*pct),
+                            );
+                            if let Err(e) = crate::schedstate::save(&act) {
+                                self.status_error = true;
+                                self.status = format!("限流状态落盘失败：{e}");
+                            }
+                        }
+                    }
+                    SchedAction::Restore { .. } => crate::schedstate::clear(),
+                }
                 notify("系统监视器 · 自动节流", &note);
             }
         }
@@ -3791,6 +3870,16 @@ fn probe_payload(line: &str) -> String {
         return if args == "()" { "（无参数）".to_string() } else { args.to_string() };
     }
     line.trim().to_string()
+}
+
+fn format_age(secs: f32) -> String {
+    if secs < 60.0 {
+        format!("{:.0} 秒", secs)
+    } else if secs < 3600.0 {
+        format!("{:.0} 分钟", secs / 60.0)
+    } else {
+        format!("{:.1} 小时", secs / 3600.0)
+    }
 }
 
 fn helper_install_hint() -> String {
