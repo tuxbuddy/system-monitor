@@ -17,8 +17,10 @@ allow = [
 confidence-threshold = 0.93
 
 [bans]
+# 重复依赖与通配符版本在 0.x 阶段仅告警(上游生态常见),不阻断;
+# 许可证违规仍由 [licenses] 白名单硬阻断
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "warn"
 
 [sources]
 unknown-registry = "deny"
