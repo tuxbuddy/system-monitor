@@ -494,7 +494,9 @@ impl RemoteSlot {
         true
     }
 
-    /// 消费端读取：仅当槽内主机与当前选择一致时返回样本。
+    /// 消费端读取：仅当槽内主机与当前选择一致时返回样本
+    /// （不带新鲜度标记的简化读取，测试与后续轻量消费用）。
+    #[allow(dead_code)]
     pub fn current(&self, host: &str) -> Option<&RemoteSample> {
         if self.host == host {
             self.sample.as_ref()

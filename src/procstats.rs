@@ -53,6 +53,8 @@ pub struct ProcSnapshot {
     pub rss_kb: u64,
     /// /proc/<pid>/stat 第 22 字段：进程启动时间（时钟滴答）。
     /// 与 pid 一起构成进程实例身份，防止信号发给 PID 复用后的无关进程。
+    /// （信号路径直接读 /proc 比对；此字段供快照消费者使用）
+    #[allow(dead_code)]
     pub starttime: u64,
     pub ppid: i32,
 }

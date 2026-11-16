@@ -93,8 +93,6 @@ pub fn load() -> Option<AppliedAction> {
 /// 对账结果：启动时读到未完成动作后如何处置。
 #[derive(Debug)]
 pub enum Reconcile {
-    /// 本机没有记录，无需处理。
-    Noop,
     /// 当前 cpu.max 仍等于我们写入的值：应精确恢复 previous_cpu_max。
     RestoreTo(String),
     /// 当前值已被外部修改：不动它，提示人工确认。

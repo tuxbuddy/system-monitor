@@ -290,7 +290,6 @@ impl CpuManagerApp {
                             ),
                         )),
                         crate::schedstate::Reconcile::Skipped { reason } => Some((true, format!("遗留限流记录跳过：{reason}"))),
-                        crate::schedstate::Reconcile::Noop => None,
                     },
                     None => Some((true, format!("遗留限流记录：分组 {group} 无法读取，请人工确认"))),
                 }

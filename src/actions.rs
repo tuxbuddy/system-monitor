@@ -99,7 +99,7 @@ fn pidfd_send(_pid: i32, _sig: i32) -> Result<(), ActionError> {
 /// 读 /proc/<pid>/stat 的 starttime（第 22 字段）。
 pub fn read_starttime(pid: i32) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let open = text.find('(')?;
+    // comm 可能含任意字符（含括号/空格），以最后一个 ')' 为界
     let close = text.rfind(')')?;
     let rest: Vec<&str> = text[close + 1..].split_whitespace().collect();
     // rest[0]=state(第3列)，starttime 是第22列 → rest[19]
