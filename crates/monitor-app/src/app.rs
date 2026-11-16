@@ -60,6 +60,95 @@ enum TableMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcCol {
+    Pid,
+    Ppid,
+    Name,
+    User,
+    Cpu,
+    Rss,
+    MemPct,
+    Io,
+    Fd,
+    Nice,
+    State,
+}
+
+/// 进程表可选列（PID/名称/CPU 始终显示）。
+#[derive(Clone, PartialEq, Eq)]
+struct ProcCols {
+    ppid: bool,
+    user: bool,
+    rss: bool,
+    mempct: bool,
+    nice: bool,
+    io: bool,
+    fd: bool,
+    state: bool,
+}
+
+impl Default for ProcCols {
+    fn default() -> Self {
+        Self { ppid: true, user: true, rss: true, mempct: true, nice: true, io: false, fd: false, state: true }
+    }
+}
+
+impl ProcCols {
+    fn from_key(key: &str) -> Self {
+        let mut c = Self { ppid: false, user: false, rss: false, mempct: false, nice: false, io: false, fd: false, state: false };
+        for part in key.split(',') {
+            match part.trim() {
+                "ppid" => c.ppid = true,
+                "user" => c.user = true,
+                "rss" => c.rss = true,
+                "mempct" => c.mempct = true,
+                "nice" => c.nice = true,
+                "io" => c.io = true,
+                "fd" => c.fd = true,
+                "state" => c.state = true,
+                _ => {}
+            }
+        }
+        c
+    }
+
+    fn to_key(&self) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        if self.ppid { out.push("ppid"); }
+        if self.user { out.push("user"); }
+        if self.rss { out.push("rss"); }
+        if self.mempct { out.push("mempct"); }
+        if self.nice { out.push("nice"); }
+        if self.io { out.push("io"); }
+        if self.fd { out.push("fd"); }
+        if self.state { out.push("state"); }
+        out.join(",")
+    }
+
+    fn visible(&self) -> Vec<ProcCol> {
+        let mut v = vec![ProcCol::Pid];
+        if self.ppid { v.push(ProcCol::Ppid); }
+        v.push(ProcCol::Name);
+        if self.user { v.push(ProcCol::User); }
+        v.push(ProcCol::Cpu);
+        if self.rss { v.push(ProcCol::Rss); }
+        if self.mempct { v.push(ProcCol::MemPct); }
+        if self.io { v.push(ProcCol::Io); }
+        if self.fd { v.push(ProcCol::Fd); }
+        if self.nice { v.push(ProcCol::Nice); }
+        if self.state { v.push(ProcCol::State); }
+        v
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetStateFilter {
+    All,
+    Listen,
+    Established,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfirmKind {
     Terminate,
     Kill,
@@ -92,6 +181,29 @@ struct NiceDialog {
     value: i32,
 }
 
+/// 操作结果浮层提示：3 秒后自动消失，不打断当前操作。
+struct Toast {
+    text: String,
+    error: bool,
+    at: Instant,
+}
+
+/// 总览页的一台主机。
+struct FleetRow {
+    sel: Option<String>,
+    label: String,
+    os: String,
+    ok: bool,
+    cpu: f32,
+    mem: f32,
+    temp: f32,
+    gpu: f32,
+    load: f32,
+    procs: usize,
+    error: Option<String>,
+    age: Option<u64>,
+}
+
 #[derive(Clone)]
 struct AutoRule {
     pattern: String,
@@ -113,7 +225,7 @@ struct SharedMetrics {
     procs: usize,
 }
 
-const HIST_CAP: usize = 120;
+const HIST_CAP: usize = 900;
 
 #[derive(Default)]
 struct PerfHistory {
@@ -185,6 +297,9 @@ enum UiJobOutcome {
     MovedIn(i32, PathBuf),
 }
 
+/// 探针扫描后台结果：目标主机 + 快照或错误。
+type ProbeScanMsg = (Option<remote::SshTarget>, Result<probe::Snapshot, String>);
+
 pub struct CpuManagerApp {
     sampler: Sampler,
     usage: Usage,
@@ -219,6 +334,13 @@ pub struct CpuManagerApp {
     filesystems: Vec<FsUsage>,
     net_conns: Vec<NetConn>,
     net_filter: String,
+    net_state: NetStateFilter,
+    /// 本地 socket inode → (pid, comm)，按需刷新（网络页）。
+    net_owner: HashMap<u64, (i32, String)>,
+    net_owner_at: Instant,
+    /// 进程表可选列与 I/O/FD 缓存（按需采集）。
+    cols: ProcCols,
+    proc_extra: HashMap<i32, (Instant, Option<procstats::ProcExtra>)>,
     auto_enabled: bool,
     auto_rules: Vec<AutoRule>,
     auto_skip: std::collections::HashSet<i32>,
@@ -245,9 +367,19 @@ pub struct CpuManagerApp {
     alert_mem: f32,
     alert_temp: f32,
     dash_open: bool,
+    toast: Option<Toast>,
+    /// 性能页趋势图时间窗（采样数）。
+    chart_window: usize,
+    /// 设置弹窗。
+    settings_open: bool,
+    /// 当前远端的采样健康度（ok, 文案）。
+    remote_health: Option<(bool, String)>,
+    /// 分组实时 CPU 占用（来自 cpu.stat usage_usec 差分）。
+    group_usage: HashMap<String, f32>,
+    group_usage_prev: HashMap<String, (u64, Instant)>,
     saved_cfg: AppConfig,
     probe: Option<probe::Snapshot>,
-    probe_rx: Option<std::sync::mpsc::Receiver<probe::Snapshot>>,
+    probe_rx: Option<std::sync::mpsc::Receiver<ProbeScanMsg>>,
     probe_query: String,
     probe_mode: ProbeMode,
     probe_sel: Option<ProbeSel>,
@@ -266,6 +398,12 @@ pub struct CpuManagerApp {
     probe_test_cmd: String,
     probe_test_child: Option<std::process::Child>,
     probe_armed_pid: Option<u32>,
+    /// 当前快照来源：None=本机，Some=远端。
+    probe_source: Option<remote::SshTarget>,
+    probe_scan_err: Option<String>,
+    /// 活动探针所在远端（None=本机）。
+    probe_armed_remote: Option<remote::SshTarget>,
+    probe_test_remote_pid: Option<u32>,
     /// 历史写入失败的一次性报告（同错误不重复提示）。
     hist_err: Option<String>,
     /// 调度熔断告警只提示一次，重新启用后复位。
@@ -373,6 +511,11 @@ impl CpuManagerApp {
             filesystems: Vec::new(),
             net_conns: Vec::new(),
             net_filter: String::new(),
+            net_state: NetStateFilter::All,
+            net_owner: HashMap::new(),
+            net_owner_at: Instant::now(),
+            cols: ProcCols::from_key(&cfg.proc_cols),
+            proc_extra: HashMap::new(),
             auto_enabled: false,
             auto_rules: Vec::new(),
             auto_skip: std::collections::HashSet::new(),
@@ -399,6 +542,12 @@ impl CpuManagerApp {
             alert_mem: cfg.alert_mem,
             alert_temp: cfg.alert_temp,
             dash_open: cfg.dash_open,
+            toast: None,
+            chart_window: cfg.chart_window.clamp(120, 900) as usize,
+            settings_open: false,
+            remote_health: None,
+            group_usage: HashMap::new(),
+            group_usage_prev: HashMap::new(),
             saved_cfg: cfg,
             probe: None,
             probe_rx: None,
@@ -420,6 +569,10 @@ impl CpuManagerApp {
             probe_test_cmd: String::new(),
             probe_test_child: None,
             probe_armed_pid: None,
+            probe_source: None,
+            probe_scan_err: None,
+            probe_armed_remote: None,
+            probe_test_remote_pid: None,
             hist_err: None,
             sched_halt_warned: false,
             job_tx,
@@ -446,6 +599,7 @@ impl CpuManagerApp {
             self.resample_remote(&target);
             return;
         }
+        self.remote_health = None;
         self.usage = self.sampler.sample();
         self.pi = pi::read_pi_stats();
         self.local_view = Some((self.usage.clone(), self.pi.clone()));
@@ -613,14 +767,19 @@ impl CpuManagerApp {
             self.filesystems = f.sample.filesystems;
             self.net_conns = f.sample.conns;
             self.perf.record(&self.usage, &self.pi);
-            if let Some(err) = &f.last_error {
+            self.remote_health = Some(if let Some(err) = &f.last_error {
                 self.status_error = true;
                 self.status = format!("远端采集失败（显示 {} 前的数据）：{}", format_age(f.age_secs), err);
+                (false, format!("远端失败 · {} 前数据", format_age(f.age_secs)))
             } else if f.stale {
                 self.status_error = true;
                 self.status = format!("数据已过期（{} 前采样），正在重试…", format_age(f.age_secs));
-            }
+                (false, format!("远端过期 · {}", format_age(f.age_secs)))
+            } else {
+                (true, format!("远端 {} 前", format_age(f.age_secs)))
+            });
         } else {
+            self.remote_health = Some((false, "远端等待数据…".to_string()));
             self.filesystems.clear();
             self.net_conns.clear();
         }
@@ -668,14 +827,54 @@ impl CpuManagerApp {
     }
 
     fn report(&mut self, result: Result<(), ActionError>, ok_msg: String) {
-        self.status_error = result.is_err();
-        self.status = match &result {
+        let ok = result.is_ok();
+        let msg = match &result {
             Ok(()) => ok_msg,
             Err(e) => e.to_string(),
         };
+        self.flash(ok, msg);
         if matches!(result, Err(ActionError::Gone)) {
             self.resample();
         }
+    }
+
+    /// 更新状态行并弹出短暂的浮动提示（成功/失败）。
+    fn flash(&mut self, ok: bool, msg: String) {
+        self.status_error = !ok;
+        self.status = msg.clone();
+        self.toast = Some(Toast { text: msg, error: !ok, at: Instant::now() });
+    }
+
+    /// 浮动提示：居中偏上/底部显示 3 秒，动作失败用红色。
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.toast.as_ref() else {
+            return;
+        };
+        if t.at.elapsed() > Duration::from_secs(3) {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(120));
+        let (text, error) = (t.text.clone(), t.error);
+        let (bg, fg) = if error {
+            (theme::tint(theme::DANGER, 0.20), theme::DANGER)
+        } else {
+            (theme::tint(theme::SUCCESS, 0.18), theme::SUCCESS)
+        };
+        egui::Area::new(egui::Id::unique("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(bg)
+                    .stroke(Stroke::new(1.0, theme::tint(fg, 0.55)))
+                    .corner_radius(9)
+                    .inner_margin(Margin::symmetric(16, 8))
+                    .shadow(egui::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(90) })
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).size(12.5).color(fg));
+                    });
+            });
     }
 
     /// 当前视角下的「我自己」：本机为登录 uid，远端为 SSH 登录 uid。
@@ -705,7 +904,10 @@ impl CpuManagerApp {
                 UiJobOutcome::Report(r, msg) => self.report(r, msg),
                 UiJobOutcome::Cmdline(pid, c) => self.cmdline_cache = Some((pid, c)),
                 UiJobOutcome::Details(boxed) => self.details = Some(*boxed),
-                UiJobOutcome::Groups(g) => self.groups = g,
+                UiJobOutcome::Groups(g) => {
+                    self.groups = g;
+                    self.update_group_usage();
+                }
                 UiJobOutcome::BaseReady(host, base) => self.remote_cg_base = Some((host, base)),
                 UiJobOutcome::MovedIn(pid, orig) => {
                     self.original_of.insert(pid, orig);
@@ -717,14 +919,12 @@ impl CpuManagerApp {
                 }
                 UiJobOutcome::Remote(ok, msg) => {
                     if ok {
-                        self.status_error = false;
-                        self.status = msg;
+                        self.flash(true, msg);
                         if self.host_sel.is_some() && self.remote_write {
                             self.refresh_groups(); // 后台拉取最新分组
                         }
                     } else {
-                        self.status_error = true;
-                        self.status = msg;
+                        self.flash(false, msg);
                     }
                 }
             }
@@ -912,6 +1112,26 @@ impl CpuManagerApp {
         } else {
             self.groups.clear();
         }
+        self.update_group_usage();
+    }
+
+    /// 用 cpu.stat usage_usec 差分估算分组实时 CPU（按全机核心数归一）。
+    fn update_group_usage(&mut self) {
+        let now = Instant::now();
+        let cores = self.usage.core_percent.len().max(1) as f32;
+        let mut next = HashMap::new();
+        for g in &self.groups {
+            if let Some((prev, at)) = self.group_usage_prev.get(&g.name) {
+                let dt = now.duration_since(*at).as_secs_f32();
+                if dt > 0.05 && g.usage_usec >= *prev {
+                    next.insert(g.name.clone(), (g.usage_usec - *prev) as f32 / 1e6 / dt / cores * 100.0);
+                }
+            }
+        }
+        for g in &self.groups {
+            self.group_usage_prev.insert(g.name.clone(), (g.usage_usec, now));
+        }
+        self.group_usage = next;
     }
 
     fn remote_write_host(&self) -> Option<remote::SshTarget> {
@@ -1310,6 +1530,8 @@ impl CpuManagerApp {
             alert_mem: self.alert_mem,
             alert_temp: self.alert_temp,
             dash_open: self.dash_open,
+            proc_cols: self.cols.to_key(),
+            chart_window: self.chart_window as u32,
         }
     }
 
@@ -1408,7 +1630,7 @@ impl CpuManagerApp {
             .usage
             .procs
             .iter()
-            .filter(|p| f.is_empty() || p.comm.contains(f) || p.pid.to_string().contains(f))
+            .filter(|p| f.is_empty() || proc_matches(p, f))
             .filter(|p| !self.own_only || p.uid == self.active_uid())
             .cloned()
             .collect();
@@ -1459,7 +1681,7 @@ impl CpuManagerApp {
     }
 
     fn handle_keys(&mut self, ui: &mut egui::Ui) {
-        let modal_open = self.confirm.is_some() || self.nice_dialog.is_some() || self.details.is_some() || self.platform_edit.is_some() || self.add_host.is_some();
+        let modal_open = self.confirm.is_some() || self.nice_dialog.is_some() || self.details.is_some() || self.platform_edit.is_some() || self.add_host.is_some() || self.settings_open;
         let typing = ui.ctx().text_edit_focused();
         // Esc：先关弹窗，再清搜索，最后清选中
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1469,6 +1691,7 @@ impl CpuManagerApp {
                 self.details = None;
                 self.platform_edit = None;
                 self.add_host = None;
+                self.settings_open = false;
             } else if !self.filter.is_empty() {
                 self.filter.clear();
             } else {
@@ -1690,6 +1913,25 @@ impl CpuManagerApp {
                     if action_btn(ui, "迷你", theme::TEXT_SEC, true, false) {
                         self.set_mini(ui.ctx(), true);
                     }
+                    if action_btn(ui, "设置", theme::TEXT_SEC, true, false) {
+                        self.settings_open = true;
+                    }
+                    if self.pending_ops > 0 {
+                        ui.add_space(10.0);
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::INFO));
+                        ui.label(RichText::new(format!("后台操作 {}", self.pending_ops)).size(11.5).color(theme::INFO));
+                    }
+                    if let Some((ok, text)) = self.remote_health.clone() {
+                        ui.add_space(10.0);
+                        if action_btn(ui, "重试", theme::INFO, true, false) {
+                            self.resample();
+                        }
+                        ui.add_space(6.0);
+                        let color = if ok { theme::SUCCESS } else { theme::DANGER };
+                        let (d, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(d.center(), 3.0, color);
+                        ui.label(RichText::new(text).size(11.0).color(color));
+                    }
                     ui.add_space(10.0);
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(l) = self.usage.load {
@@ -1718,22 +1960,35 @@ impl CpuManagerApp {
                         ui.label(RichText::new(format!("告警：{}", alerts.join(" · "))).size(12.5).color(theme::DANGER));
                     });
             }
-            let show_cards = self.view == View::Monitor && self.dash_open;
+            let short = ui.ctx().content_rect().height() < 700.0;
+            let show_cards = self.view == View::Monitor && self.dash_open && !short;
             if show_cards {
                 ui.add_space(10.0);
                 let gap = 12.0;
                 let total = ui.available_width();
-                let cw = ((total - 3.0 * gap) / 4.0 - 30.0).max(168.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    self.cpu_card(ui, cw);
-                    ui.add_space(gap);
-                    self.mem_card(ui, cw);
-                    ui.add_space(gap);
-                    self.energy_card(ui, cw);
-                    ui.add_space(gap);
-                    self.gpu_card(ui, cw);
-                });
+                let ncol = if total >= 1120.0 { 4 } else if total >= 700.0 { 2 } else { 1 };
+                let cw = ((total - gap * (ncol as f32 - 1.0)) / ncol as f32 - 30.0).max(168.0);
+                let mut idx = 0;
+                while idx < 4 {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for j in idx..(idx + ncol).min(4) {
+                            if j > idx {
+                                ui.add_space(gap);
+                            }
+                            match j {
+                                0 => self.cpu_card(ui, cw),
+                                1 => self.mem_card(ui, cw),
+                                2 => self.energy_card(ui, cw),
+                                _ => self.gpu_card(ui, cw),
+                            }
+                        }
+                    });
+                    idx += ncol;
+                    if idx < 4 {
+                        ui.add_space(gap);
+                    }
+                }
             } else {
                 ui.add_space(9.0);
                 self.vitals_strip(ui);
@@ -1804,6 +2059,10 @@ impl CpuManagerApp {
                         let peak = self.usage.core_percent.iter().copied().fold(0.0_f32, f32::max);
                         let avg = self.usage.core_percent.iter().sum::<f32>() / n as f32;
                         ui.label(RichText::new(format!("峰值 {peak:.0}% · 均值 {avg:.0}%")).size(10.5).monospace().color(theme::TEXT_MUTED));
+                    }
+                    if let Some(d) = trend_delta(&self.perf.cpu) {
+                        ui.add_space(6.0);
+                        delta_chip(ui, d, "%", 1);
                     }
                 });
             });
@@ -1888,6 +2147,11 @@ impl CpuManagerApp {
                     ui.label(RichText::new(format!("{used_gb:.1}")).size(32.0).monospace().strong().color(theme::MEM))
                         .on_hover_text("已用内存 ≈ 总量 − 空闲 − 缓冲 − 缓存。");
                     ui.label(RichText::new(format!("/ {total_gb:.1} GB")).size(14.0).color(theme::TEXT_SEC));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(d) = trend_delta(&self.perf.mem) {
+                            delta_chip(ui, d, "%", 1);
+                        }
+                    });
                 });
                 ui.add(egui::ProgressBar::new(frac).desired_width(w).desired_height(6.0).fill(theme::MEM).corner_radius(3).animate(true));
                 let sfrac = if m.swap_total_kb == 0 { 0.0 } else { (m.swap_used_kb() as f32 / m.swap_total_kb as f32).clamp(0.0, 1.0) };
@@ -1897,7 +2161,7 @@ impl CpuManagerApp {
                     ui.label(RichText::new(format!("{:.0}/{:.0} MB", m.swap_used_kb() as f64 / 1024.0, m.swap_total_kb as f64 / 1024.0)).size(10.0).monospace().color(theme::TEXT_MUTED));
                 });
                 ui.label(RichText::new(format!("空闲 {:.0} MB · 缓冲 {:.0} MB · 缓存 {:.0} MB", m.free_kb as f64 / 1024.0, m.buffers_kb as f64 / 1024.0, m.cached_kb as f64 / 1024.0)).size(10.5).color(theme::TEXT_MUTED));
-                sparkline_of(ui, w, 24.0, &self.perf.mem, theme::MEM, 100.0, HIST_CAP);
+                sparkline_of(ui, w, 24.0, &self.perf.mem, theme::MEM, 100.0, 120);
             } else {
                 card_title(ui, theme::MEM, "内存", "");
                 ui.label(RichText::new("—").color(theme::TEXT_MUTED));
@@ -1918,6 +2182,12 @@ impl CpuManagerApp {
                         "SoC 温度。温度升高由绿转琥珀再转红；树莓派约 85°C 触发降频保护。"
                     });
                 ui.label(RichText::new("°C").size(15.0).color(theme::TEXT_SEC));
+                if self.pi.temp_c.is_some()
+                    && let Some(d) = trend_delta(&self.perf.temp)
+                {
+                    ui.add_space(6.0);
+                    delta_chip(ui, d, "°C", 1);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.vertical(|ui| {
                         if let Some(f) = self.pi.freq_ghz {
@@ -1965,7 +2235,7 @@ impl CpuManagerApp {
                 });
             }
             if self.pi.temp_c.is_some() {
-                sparkline_of(ui, w, 24.0, &self.perf.temp, tcolor, 100.0, HIST_CAP);
+                sparkline_of(ui, w, 24.0, &self.perf.temp, tcolor, 100.0, 120);
             }
             egui::CollapsingHeader::new(RichText::new("供电详情").size(12.0).color(theme::TEXT_SEC)).default_open(false).show(ui, |ui| {
                 if self.pi.rails.is_empty() {
@@ -2049,7 +2319,7 @@ impl CpuManagerApp {
 
     fn sparkline(&self, ui: &mut egui::Ui, width: f32, height: f32) {
         let line = theme::heat_color(self.usage.total_percent / 100.0);
-        sparkline_of(ui, width, height, &self.perf.cpu, line, 100.0, HIST_CAP);
+        sparkline_of(ui, width, height, &self.perf.cpu, line, 100.0, 120);
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
@@ -2070,7 +2340,8 @@ impl CpuManagerApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("搜索").size(12.5).color(theme::TEXT_SEC));
-                ui.add(egui::TextEdit::singleline(&mut self.filter).id(egui::Id::unique("proc_search")).hint_text("进程名称或 PID").desired_width(200.0));
+                ui.add(egui::TextEdit::singleline(&mut self.filter).id(egui::Id::unique("proc_search")).hint_text("名称/PID · user: · state: · cpu>50").desired_width(228.0))
+                    .on_hover_text("多条件用空格分隔：user:zhangyi state:R cpu>50 mem>2 nice<0");
                 if action_btn(ui, "导出快照", theme::TEXT_SEC, true, false) {
                     self.export_snapshot();
                 }
@@ -2083,6 +2354,20 @@ impl CpuManagerApp {
                     ui.add_space(12.0);
                     ui.checkbox(&mut self.own_only, RichText::new("仅本用户").size(12.5));
                     ui.add_space(2.0);
+                    ui.menu_button(RichText::new("列 ▾").size(12.5), |ui| {
+                        ui.set_min_width(150.0);
+                        ui.checkbox(&mut self.cols.ppid, "PPID");
+                        ui.checkbox(&mut self.cols.user, "用户");
+                        ui.checkbox(&mut self.cols.rss, "内存 MB");
+                        ui.checkbox(&mut self.cols.mempct, "内存 %");
+                        ui.checkbox(&mut self.cols.nice, "nice");
+                        ui.checkbox(&mut self.cols.state, "状态");
+                        ui.separator();
+                        ui.checkbox(&mut self.cols.io, "磁盘 I/O");
+                        ui.checkbox(&mut self.cols.fd, "FD");
+                        ui.label(RichText::new("I/O/FD 仅本机采集，每 2 秒刷新").size(10.5).color(theme::TEXT_MUTED));
+                    });
+                    ui.add_space(2.0);
                     ui.selectable_value(&mut self.table_mode, TableMode::Apps, RichText::new("应用").size(12.5));
                     ui.selectable_value(&mut self.table_mode, TableMode::Tree, RichText::new("树形").size(12.5));
                     ui.selectable_value(&mut self.table_mode, TableMode::Flat, RichText::new("平铺").size(12.5));
@@ -2093,7 +2378,30 @@ impl CpuManagerApp {
                 Some((_, cmd)) => (truncate_chars(cmd, 200), theme::TEXT_SEC, cmd.clone()),
                 None => ("选中一个进程以查看完整命令行".to_string(), theme::TEXT_MUTED, String::new()),
             };
+            let sel_meta = self
+                .selected
+                .and_then(|pid| self.usage.procs.iter().find(|p| p.pid == pid))
+                .map(|p| (p.user.clone(), p.state, p.nice, p.cpu_percent, p.mem_percent, p.rss_kb));
             egui::Frame::NONE.fill(theme::EXTREME).corner_radius(6).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
+                if let Some((user, state, nice, cpu, mem_pct, rss_kb)) = sel_meta {
+                    ui.horizontal(|ui| {
+                        let (state_label, state_color) = theme::state_badge(state);
+                        ui.label(RichText::new("用户").size(10.0).color(theme::TEXT_MUTED));
+                        ui.label(RichText::new(user).size(10.5).color(theme::TEXT_SEC));
+                        ui.add_space(6.0);
+                        badge(ui, state_label, state_color);
+                        ui.label(
+                            RichText::new(format!(
+                                "优先级 {nice} · CPU {cpu:.1}% · 内存 {mem_pct:.1}% · RSS {:.1} MB",
+                                rss_kb as f32 / 1024.0
+                            ))
+                            .size(10.5)
+                            .monospace()
+                            .color(theme::TEXT_MUTED),
+                        );
+                    });
+                    ui.add_space(4.0);
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("命令行").size(11.0).color(theme::TEXT_MUTED));
                     if full.is_empty() {
@@ -2112,33 +2420,46 @@ impl CpuManagerApp {
             });
             ui.add_space(8.0);
             let rows = self.visible_rows();
-            TableBuilder::new(ui)
+            if (self.cols.io || self.cols.fd) && self.host_sel.is_none() {
+                let now = Instant::now();
+                let mut budget = 80usize;
+                for (p, _) in &rows {
+                    if budget == 0 {
+                        break;
+                    }
+                    let stale = self.proc_extra.get(&p.pid).is_none_or(|(t, _)| t.elapsed() >= Duration::from_secs(2));
+                    if stale {
+                        let ex = procstats::read_proc_extra(p.pid);
+                        self.proc_extra.insert(p.pid, (now, ex));
+                        budget -= 1;
+                    }
+                }
+                self.proc_extra
+                    .retain(|pid, (t, _)| rows.iter().any(|(p, _)| p.pid == *pid) || t.elapsed() < Duration::from_secs(30));
+            }
+            let cols = self.cols.visible();
+            let mut tb = TableBuilder::new(ui)
                 .striped(true)
                 .sense(egui::Sense::click())
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::exact(72.0))
-                .column(Column::exact(56.0))
-                .column(Column::remainder())
-                .column(Column::exact(96.0))
-                .column(Column::exact(84.0))
-                .column(Column::exact(96.0))
-                .column(Column::exact(76.0))
-                .column(Column::exact(60.0))
-                .column(Column::exact(80.0))
-                .header(28.0, |mut header| {
-                    for (col, title, numeric) in [
-                        (SortCol::Pid, "PID", false),
-                        (SortCol::Ppid, "PPID", true),
-                        (SortCol::Name, "名称", false),
-                        (SortCol::User, "用户", false),
-                        (SortCol::Cpu, "CPU%", true),
-                        (SortCol::Mem, "内存MB", true),
-                        (SortCol::MemPct, "内存%", true),
-                        (SortCol::Nice, "nice", true),
-                        (SortCol::State, "状态", false),
-                    ] {
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for c in &cols {
+                let (_, w, _, _) = col_meta(*c);
+                tb = tb.column(if w > 0.0 { Column::exact(w) } else { Column::remainder() });
+            }
+            tb.header(28.0, |mut header| {
+                    for c in &cols {
+                        let (title, _, sort, numeric) = col_meta(*c);
                         header.col(|ui| {
                             ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
+                            let Some(col) = sort else {
+                                let btn = egui::Button::new(RichText::new(title).size(12.0).strong().color(theme::TEXT_SEC)).frame(false);
+                                if numeric {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.add(btn); });
+                                } else {
+                                    ui.add(btn);
+                                }
+                                return;
+                            };
                             let active = self.sort_col == col;
                             let arrow = if active { if self.sort_desc { " ▼" } else { " ▲" } } else { "" };
                             let color = if active { theme::CPU } else { theme::TEXT_SEC };
@@ -2164,52 +2485,94 @@ impl CpuManagerApp {
                         let (p, depth) = &rows[row.index()];
                         let is_sel = self.selected == Some(p.pid);
                         row.set_selected(is_sel);
-                        row.col(|ui| {
-                            if is_sel {
-                                let r = ui.max_rect();
-                                ui.painter().rect_filled(egui::Rect::from_min_max(r.min, Pos2::new(r.min.x + 3.0, r.max.y)), 0.0, theme::CPU);
-                            }
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(p.pid.to_string()).size(12.5).monospace().color(if is_sel { theme::TEXT } else { theme::TEXT_SEC }));
-                        });
-                        row.col(|ui| {
-                            ui.label(RichText::new(p.ppid.to_string()).size(12.0).monospace().color(theme::TEXT_MUTED));
-                        });
-                        row.col(|ui| {
-                            let indent = if *depth == 0 {
-                                String::new()
-                            } else {
-                                format!("{}└ ", "  ".repeat(*depth as usize - 1))
-                            };
-                            ui.label(RichText::new(format!("{indent}{}", p.comm)).size(12.5).strong().color(theme::TEXT));
-                        });
-                        row.col(|ui| {
-                            ui.label(RichText::new(p.user.as_str()).size(12.0).color(theme::TEXT_SEC));
-                        });
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1}", p.cpu_percent)).size(12.5).monospace().color(theme::heat_color(p.cpu_percent / 100.0)));
+                        for c in &cols {
+                            row.col(|ui| match c {
+                                ProcCol::Pid => {
+                                    if is_sel {
+                                        let r = ui.max_rect();
+                                        ui.painter().rect_filled(egui::Rect::from_min_max(r.min, Pos2::new(r.min.x + 3.0, r.max.y)), 0.0, theme::CPU);
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(p.pid.to_string()).size(12.5).monospace().color(if is_sel { theme::TEXT } else { theme::TEXT_SEC }));
+                                }
+                                ProcCol::Ppid => {
+                                    ui.label(RichText::new(p.ppid.to_string()).size(12.0).monospace().color(theme::TEXT_MUTED));
+                                }
+                                ProcCol::Name => {
+                                    let indent = if *depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(*depth as usize - 1)) };
+                                    ui.add(egui::Label::new(RichText::new(format!("{indent}{}", p.comm)).size(12.5).strong().color(theme::TEXT)).truncate())
+                                        .on_hover_text(&p.comm);
+                                }
+                                ProcCol::User => {
+                                    ui.label(RichText::new(p.user.as_str()).size(12.0).color(theme::TEXT_SEC));
+                                }
+                                ProcCol::Cpu => {
+                                    let r = ui.max_rect();
+                                    let f = (p.cpu_percent / 100.0).clamp(0.0, 1.0);
+                                    if f > 0.0 {
+                                        let w = r.width() * f;
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_max(Pos2::new(r.right() - w, r.top() + 4.0), Pos2::new(r.right(), r.bottom() - 4.0)),
+                                            3.0,
+                                            theme::tint(theme::heat_color(f), 0.22),
+                                        );
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(format!("{:.1}", p.cpu_percent)).size(12.5).monospace().color(theme::heat_color(p.cpu_percent / 100.0)));
+                                    });
+                                }
+                                ProcCol::Rss => {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(format!("{:.1}", p.rss_kb as f32 / 1024.0)).size(12.5).monospace().color(theme::TEXT_SEC));
+                                    });
+                                }
+                                ProcCol::MemPct => {
+                                    let r = ui.max_rect();
+                                    let f = (p.mem_percent / 25.0).clamp(0.0, 1.0);
+                                    if f > 0.0 {
+                                        let w = r.width() * f;
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_max(Pos2::new(r.right() - w, r.top() + 4.0), Pos2::new(r.right(), r.bottom() - 4.0)),
+                                            3.0,
+                                            theme::tint(theme::MEM, 0.18),
+                                        );
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(format!("{:.1}", p.mem_percent)).size(12.5).monospace().color(theme::heat_color(p.mem_percent / 100.0)))
+                                            .on_hover_text("占整机内存比例；条形按 25% 封顶");
+                                    });
+                                }
+                                ProcCol::Io => {
+                                    let ex = self.proc_extra.get(&p.pid).and_then(|(_, e)| e.as_ref());
+                                    let txt = if self.host_sel.is_some() {
+                                        "—".to_string()
+                                    } else {
+                                        ex.map(|e| format!("{:.1}/{:.1}", e.read_bytes as f64 / 1048576.0, e.write_bytes as f64 / 1048576.0))
+                                            .unwrap_or_else(|| "—".to_string())
+                                    };
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.add(egui::Label::new(RichText::new(txt).size(11.0).monospace().color(theme::TEXT_SEC)).truncate())
+                                            .on_hover_text("累计磁盘读/写（MB），仅本机采集");
+                                    });
+                                }
+                                ProcCol::Fd => {
+                                    let fds = self.proc_extra.get(&p.pid).and_then(|(_, e)| e.as_ref()).map(|e| e.fds);
+                                    let txt = if self.host_sel.is_some() { "—".to_string() } else { fds.map(|f| f.to_string()).unwrap_or_else(|| "—".into()) };
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(txt).size(11.5).monospace().color(theme::TEXT_MUTED)).on_hover_text("打开的文件描述符数（仅本机）");
+                                    });
+                                }
+                                ProcCol::Nice => {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(p.nice.to_string()).size(12.5).monospace().color(theme::TEXT_MUTED));
+                                    });
+                                }
+                                ProcCol::State => {
+                                    let (label, color) = theme::state_badge(p.state);
+                                    badge(ui, label, color).on_hover_text(format!("原始状态码: {}", p.state));
+                                }
                             });
-                        });
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1}", p.rss_kb as f32 / 1024.0)).size(12.5).monospace().color(theme::TEXT_SEC));
-                            });
-                        });
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1}", p.mem_percent)).size(12.5).monospace().color(theme::heat_color(p.mem_percent / 100.0)));
-                            });
-                        });
-                        row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(p.nice.to_string()).size(12.5).monospace().color(theme::TEXT_MUTED));
-                            });
-                        });
-                        row.col(|ui| {
-                            let (label, color) = theme::state_badge(p.state);
-                            badge(ui, label, color).on_hover_text(format!("原始状态码: {}", p.state));
-                        });
+                        }
                         let resp = row.response();
                         if resp.clicked() {
                             self.selected = Some(p.pid);
@@ -2364,10 +2727,48 @@ impl CpuManagerApp {
                     badge(ui, &format!("CPU {cap}"), cap_color);
                     let pids = g.pids_max.map(|m| format!(" · ≤{m} 进程")).unwrap_or_default();
                     ui.label(RichText::new(format!("权重 {} · {} 个进程{pids}", g.cpu_weight, g.procs)).size(11.0).color(theme::TEXT_MUTED));
+                    if let Some((periods, throttled, usec)) = g.throttle
+                        && periods > 0
+                        && throttled > 0
+                    {
+                        let pct = throttled as f64 / periods as f64 * 100.0;
+                        let color = if pct >= 20.0 {
+                            theme::DANGER
+                        } else if pct >= 5.0 {
+                            theme::WARNING
+                        } else {
+                            theme::TEXT_MUTED
+                        };
+                        badge(ui, &format!("节流 {pct:.0}%"), color).on_hover_text(format!(
+                            "{throttled}/{periods} 个周期被限流，累计 {:.1} 秒",
+                            usec as f64 / 1e6
+                        ));
+                    }
+                    if let Some(&usage) = self.group_usage.get(&g.name) {
+                        let cores = self.usage.core_percent.len().max(1) as f32;
+                        let frac = (usage / (100.0 * cores)).clamp(0.0, 1.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(84.0)
+                                .desired_height(6.0)
+                                .fill(theme::heat_color(frac))
+                                .corner_radius(3),
+                        )
+                        .on_hover_text("分组 CPU 占用（cpu.stat 差分，按全机核心数归一）");
+                        ui.label(RichText::new(format!("{usage:.0}%")).size(10.5).monospace().color(theme::heat_color(frac)));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if action_btn(ui, "删除", theme::DANGER, available, false) {
                             self.do_delete_group(&g.name);
                         }
+                        ui.menu_button(RichText::new("限速").size(12.0), |ui| {
+                            for (label, pct) in [("25%", Some(25u32)), ("50%", Some(50)), ("100%", Some(100)), ("200%", Some(200)), ("不限", None)] {
+                                if ui.add_enabled(available, egui::Button::new(label)).clicked() {
+                                    self.do_set_cpu_max(&g.name, pct);
+                                    ui.close();
+                                }
+                            }
+                        });
                     });
                 });
             }
@@ -2555,6 +2956,11 @@ impl CpuManagerApp {
 
     fn network_view(&mut self, ui: &mut egui::Ui) {
         let all = self.net_conns.clone();
+        // 本机按需反查 socket 持有进程（每 5 秒刷新，避免每帧扫描 /proc/*/fd）
+        if self.host_sel.is_none() && !all.is_empty() && self.net_owner_at.elapsed() >= Duration::from_secs(5) {
+            self.net_owner = procstats::socket_owners();
+            self.net_owner_at = Instant::now();
+        }
         let listens = all.iter().filter(|c| c.state == "LISTEN").count();
         let estab = all.iter().filter(|c| c.state == "ESTABLISHED").count();
         let rx = self.usage.net_rx_bps / 1024.0;
@@ -2576,7 +2982,7 @@ impl CpuManagerApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.net_filter)
                         .id(egui::Id::unique("net_search"))
-                        .hint_text("地址 / 协议 / 状态")
+                        .hint_text("地址 / 协议 / 状态 / 进程")
                         .desired_width(190.0),
                 );
                 ui.label(RichText::new("过滤").size(11.5).color(theme::TEXT_MUTED));
@@ -2584,7 +2990,7 @@ impl CpuManagerApp {
         });
         if self.host_sel.is_some() {
             ui.add_space(4.0);
-            ui.label(RichText::new("连接明细与吞吐均来自当前主机（远端经 SSH 读取 /proc/net）。").size(10.5).color(theme::TEXT_MUTED));
+            ui.label(RichText::new("连接明细与吞吐均来自当前主机；进程归因只在本机可用。").size(10.5).color(theme::TEXT_MUTED));
         }
         ui.add_space(8.0);
 
@@ -2592,7 +2998,11 @@ impl CpuManagerApp {
             let width = ui.available_width();
             theme::card_frame().show(ui, |ui| {
                 ui.set_width((width - 26.0).max(160.0));
-                metric_graph(ui, title, value, color, None, data, 56.0);
+                chart(
+                    ui,
+                    ChartSpec { title, value, unit: " KB/s", color, max: None, threshold: None, data, window: 120 },
+                    56.0,
+                );
             });
         };
         ui.columns(2, |cols| {
@@ -2602,35 +3012,60 @@ impl CpuManagerApp {
         ui.add_space(10.0);
 
         let query = self.net_filter.trim().to_string();
+        let state_filter = self.net_state;
         let conns: Vec<&NetConn> = all
             .iter()
             .filter(|c| {
-                query.is_empty()
-                    || icontains(&c.proto, &query)
+                let state_ok = match state_filter {
+                    NetStateFilter::All => true,
+                    NetStateFilter::Listen => c.state == "LISTEN",
+                    NetStateFilter::Established => c.state == "ESTABLISHED",
+                };
+                if !state_ok {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                let owner = c.inode.and_then(|i| self.net_owner.get(&i));
+                icontains(&c.proto, &query)
                     || icontains(&c.local, &query)
                     || icontains(&c.remote, &query)
                     || icontains(&c.state, &query)
                     || c.uid.to_string().contains(&query)
+                    || owner.is_some_and(|(pid, comm)| icontains(comm, &query) || pid.to_string().contains(&query))
             })
             .collect();
         ui.horizontal(|ui| {
+            ui.label(RichText::new("状态").size(11.5).color(theme::TEXT_MUTED));
+            ui.selectable_value(&mut self.net_state, NetStateFilter::All, RichText::new("全部").size(12.0));
+            ui.selectable_value(&mut self.net_state, NetStateFilter::Listen, RichText::new("监听").size(12.0));
+            ui.selectable_value(&mut self.net_state, NetStateFilter::Established, RichText::new("已连接").size(12.0));
+            ui.separator();
             ui.label(
                 RichText::new(format!("显示 {} / {} 条 · 监听 {} · 已连接 {}", conns.len(), all.len(), listens, estab))
                     .size(11.5)
                     .color(theme::TEXT_MUTED),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.host_sel.is_none() {
+                    ui.label(RichText::new("双击连接可定位到持有进程").size(10.5).color(theme::TEXT_MUTED));
+                }
+            });
         });
         ui.add_space(4.0);
         TableBuilder::new(ui)
             .striped(true)
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(60.0))
-            .column(Column::exact(190.0))
+            .column(Column::exact(200.0))
             .column(Column::remainder())
-            .column(Column::exact(130.0))
-            .column(Column::exact(80.0))
+            .column(Column::exact(170.0))
+            .column(Column::exact(120.0))
+            .column(Column::exact(70.0))
             .header(26.0, |mut h| {
-                for t in ["协议", "本地地址", "远端地址", "状态", "UID"] {
+                for t in ["协议", "本地地址", "远端地址", "进程", "状态", "UID"] {
                     h.col(|ui| {
                         ui.painter().rect_filled(ui.max_rect(), 0.0, theme::SURFACE);
                         ui.label(RichText::new(t).size(12.0).strong().color(theme::TEXT_SEC));
@@ -2650,6 +3085,19 @@ impl CpuManagerApp {
                         ui.label(RichText::new(&c.remote).size(11.5).monospace().color(theme::TEXT_SEC));
                     });
                     row.col(|ui| {
+                        let owner = if self.host_sel.is_none() { c.inode.and_then(|i| self.net_owner.get(&i)) } else { None };
+                        match owner {
+                            Some((pid, comm)) => {
+                                ui.label(RichText::new(format!("{comm} · {pid}")).size(11.0).monospace().color(theme::TEXT_SEC))
+                                    .on_hover_text("socket inode → /proc/<pid>/fd 反查，每 5 秒刷新");
+                            }
+                            None => {
+                                ui.label(RichText::new("—").size(11.0).color(theme::TEXT_MUTED))
+                                    .on_hover_text("未能反查（远端主机、内核进程或权限不足）");
+                            }
+                        }
+                    });
+                    row.col(|ui| {
                         let color = if c.state == "LISTEN" {
                             theme::SUCCESS
                         } else if c.state == "ESTABLISHED" {
@@ -2662,6 +3110,17 @@ impl CpuManagerApp {
                     row.col(|ui| {
                         ui.label(RichText::new(c.uid.to_string()).size(11.5).monospace().color(theme::TEXT_MUTED));
                     });
+                    let resp = row.response();
+                    if resp.double_clicked()
+                        && self.host_sel.is_none()
+                        && let Some((pid, comm)) = c.inode.and_then(|i| self.net_owner.get(&i)).cloned()
+                    {
+                        self.selected = Some(pid);
+                        self.view = View::Monitor;
+                        self.filter.clear();
+                        self.own_only = false;
+                        self.flash(true, format!("已定位到进程 {comm}（PID {pid}）"));
+                    }
                 });
             });
         if conns.is_empty() && !query.is_empty() {
@@ -2673,30 +3132,33 @@ impl CpuManagerApp {
     }
 
     fn overview_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("主机总览 · 本地 + SSH 主机（远端每 5s 刷新）").size(12.5).strong().color(theme::TEXT_SEC));
-            if action_btn(ui, "＋ 添加主机", theme::TEXT_SEC, true, false) {
-                self.add_host = Some(String::new());
-            }
+        let mut rows: Vec<FleetRow> = Vec::new();
+        let (ok, cpu, mem, temp, gpu, load, procs) = match &self.local_view {
+            Some((u, pi)) => (
+                true,
+                u.total_percent,
+                u.mem.map(|m| if m.total_kb == 0 { 0.0 } else { m.used_kb() as f32 / m.total_kb as f32 * 100.0 }).unwrap_or(0.0),
+                pi.temp_c.unwrap_or(0.0),
+                pi.gpu.v3d_ghz.or(pi.gpu.temp_c).unwrap_or(0.0),
+                u.load.map(|l| l.one).unwrap_or(0.0),
+                u.procs.len(),
+            ),
+            None => (false, 0.0, 0.0, 0.0, 0.0, 0.0, 0),
+        };
+        rows.push(FleetRow {
+            sel: None,
+            label: "本地".to_string(),
+            os: platform::platform().os.to_string(),
+            ok,
+            cpu,
+            mem,
+            temp,
+            gpu,
+            load,
+            procs,
+            error: None,
+            age: None,
         });
-        ui.add_space(8.0);
-
-        let mut rows = Vec::new();
-        {
-            let (ok, cpu, mem, temp, gpu, load, procs) = match &self.local_view {
-                Some((u, pi)) => (
-                    true,
-                    u.total_percent,
-                    u.mem.map(|m| if m.total_kb == 0 { 0.0 } else { m.used_kb() as f32 / m.total_kb as f32 * 100.0 }).unwrap_or(0.0),
-                    pi.temp_c.unwrap_or(0.0),
-                    pi.gpu.v3d_ghz.unwrap_or(0.0),
-                    u.load.map(|l| l.one).unwrap_or(0.0),
-                    u.procs.len(),
-                ),
-                None => (false, 0.0, 0.0, 0.0, 0.0, 0.0, 0),
-            };
-            rows.push((None, "本地".to_string(), String::new(), ok, cpu, mem, temp, gpu, load, procs));
-        }
         let fleet = self.fleet.lock().ok().map(|f| f.clone()).unwrap_or_default();
         for h in &self.hosts {
             let key = h.as_str();
@@ -2704,58 +3166,116 @@ impl CpuManagerApp {
                 Some(s) => (s.ok, s.os.clone(), s.cpu, s.mem, s.temp, s.gpu, s.load1, s.procs),
                 None => (false, String::new(), 0.0, 0.0, 0.0, 0.0, 0.0, 0),
             };
-            // 失败主机在 os 列显示原因与上次成功时间,不显示假 0
-            let os = match fleet.get(key).and_then(|s| s.last_error.clone()) {
-                Some(err) => {
-                    let age = fleet
-                        .get(key)
-                        .and_then(|s| s.last_ok_at_unix)
-                        .map(|t| format!("（{} 秒前数据）", unix_now() - t))
-                        .unwrap_or_else(|| "（从未成功）".to_string());
-                    format!("⚠ {err} {age}")
-                }
-                None => os,
-            };
-            rows.push((Some(key.to_string()), key.to_string(), os, ok, cpu, mem, temp, gpu, load, procs));
+            let f = fleet.get(key);
+            let error = f.and_then(|s| s.last_error.clone());
+            let age = f.and_then(|s| s.last_ok_at_unix).map(|t| unix_now().saturating_sub(t));
+            rows.push(FleetRow {
+                sel: Some(key.to_string()),
+                label: key.to_string(),
+                os,
+                ok,
+                cpu,
+                mem,
+                temp,
+                gpu,
+                load,
+                procs,
+                error,
+                age,
+            });
         }
 
+        let total = rows.len();
+        let online = rows.iter().filter(|r| r.ok).count();
+        let avg_cpu = rows.iter().filter(|r| r.ok).map(|r| r.cpu).sum::<f32>() / online.max(1) as f32;
+        let avg_mem = rows.iter().filter(|r| r.ok).map(|r| r.mem).sum::<f32>() / online.max(1) as f32;
+        let total_procs: usize = rows.iter().filter(|r| r.ok).map(|r| r.procs).sum();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("机群总览").size(13.0).strong().color(theme::TEXT));
+            badge(ui, &format!("在线 {online}/{total}"), if online == total { theme::SUCCESS } else { theme::WARNING });
+            ui.add_space(6.0);
+            if online > 0 {
+                ui.label(
+                    RichText::new(format!("平均 CPU {avg_cpu:.0}% · 平均内存 {avg_mem:.0}% · {total_procs} 个进程"))
+                        .size(11.5)
+                        .color(theme::TEXT_SEC),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if action_btn(ui, "＋ 添加主机", theme::TEXT_SEC, true, false) {
+                    self.add_host = Some(String::new());
+                }
+                ui.add_space(8.0);
+                ui.label(RichText::new("远端每 5 秒自动刷新").size(10.5).color(theme::TEXT_MUTED));
+            });
+        });
+        ui.add_space(10.0);
+
         let selected = self.host_sel.as_ref().map(|t| t.as_str().to_string());
-        for (sel, label, os, ok, cpu, mem, temp, gpu, load, procs) in rows {
-            let is_cur = sel == selected;
+        for r in rows {
+            let is_cur = r.sel == selected;
             egui::Frame::NONE
-                .fill(if is_cur { theme::tint(theme::CPU, 0.10) } else { theme::SURFACE })
+                .fill(if is_cur { theme::tint(theme::CPU, 0.09) } else { theme::SURFACE })
                 .stroke(Stroke::new(1.0, if is_cur { theme::CPU } else { theme::BORDER }))
-                .corner_radius(8)
-                .inner_margin(Margin::symmetric(12, 8))
+                .corner_radius(10)
+                .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let (dot, _) = ui.allocate_exact_size(Vec2::new(9.0, 9.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 4.0, if ok { theme::SUCCESS } else { theme::DANGER });
-                        ui.label(RichText::new(&label).size(12.5).strong().color(theme::TEXT));
-                        if !os.is_empty() {
-                            ui.label(RichText::new(&os).size(10.5).color(theme::TEXT_MUTED));
+                        let (dot, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.0, if r.ok { theme::SUCCESS } else { theme::DANGER });
+                        ui.label(RichText::new(&r.label).size(13.5).strong().color(theme::TEXT));
+                        if is_cur {
+                            badge(ui, "当前", theme::CPU);
                         }
-                        if ok {
-                            ui.label(RichText::new(format!("CPU {:.0}%", cpu)).size(11.5).monospace().color(theme::heat_color(cpu / 100.0)));
-                            ui.label(RichText::new(format!("内存 {mem:.0}%")).size(11.5).monospace().color(theme::MEM));
-                            if temp > 0.0 {
-                                ui.label(RichText::new(format!("{temp:.0}°C")).size(11.5).monospace().color(theme::temp_color(temp)));
-                            }
-                            if gpu > 0.0 {
-                                ui.label(RichText::new(format!("GPU {gpu:.2}")).size(11.5).monospace().color(theme::GPU));
-                            }
-                            ui.label(RichText::new(format!("负载 {load:.2} · {procs} 进程")).size(11.5).color(theme::TEXT_MUTED));
-                        } else {
-                            ui.label(RichText::new("离线 / 超时").size(11.5).color(theme::DANGER));
+                        if !r.os.is_empty() {
+                            ui.label(RichText::new(&r.os).size(10.5).color(theme::TEXT_MUTED));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if action_btn(ui, "查看", theme::INFO, true, false) {
-                                self.select_host(sel.clone());
+                            if action_btn(ui, if is_cur { "已选中" } else { "查看" }, if is_cur { theme::TEXT_MUTED } else { theme::INFO }, !is_cur, false) {
+                                self.select_host(r.sel.clone());
                             }
                         });
                     });
+                    ui.add_space(6.0);
+                    if r.ok {
+                        ui.horizontal(|ui| {
+                            host_metric(ui, "CPU", &format!("{:.0}%", r.cpu), (r.cpu / 100.0).clamp(0.0, 1.0), theme::heat_color(r.cpu / 100.0));
+                            ui.add_space(16.0);
+                            host_metric(ui, "内存", &format!("{:.0}%", r.mem), (r.mem / 100.0).clamp(0.0, 1.0), theme::MEM);
+                            ui.add_space(18.0);
+                            if r.temp > 0.0 {
+                                vital(ui, "温度", &format!("{:.0}°C", r.temp), theme::temp_color(r.temp));
+                                ui.add_space(10.0);
+                            }
+                            if r.gpu > 0.0 {
+                                let gpu = if r.gpu > 10.0 {
+                                    format!("{:.0}°C", r.gpu)
+                                } else {
+                                    format!("{:.2} GHz", r.gpu)
+                                };
+                                vital(ui, "GPU", &gpu, theme::GPU);
+                                ui.add_space(10.0);
+                            }
+                            vital(ui, "负载", &format!("{:.2}", r.load), theme::TEXT_SEC);
+                            ui.add_space(10.0);
+                            vital(ui, "进程", &format!("{}", r.procs), theme::TEXT_SEC);
+                        });
+                    } else {
+                        let reason = r.error.unwrap_or_else(|| "离线 / 超时".to_string());
+                        let age = match r.age {
+                            Some(s) => format!("{s} 秒前有数据"),
+                            None => "从未成功".to_string(),
+                        };
+                        ui.label(RichText::new(format!("⚠ {reason} · {age}")).size(11.5).color(theme::DANGER));
+                    }
                 });
+            ui.add_space(8.0);
+        }
+
+        if self.hosts.is_empty() {
             ui.add_space(6.0);
+            ui.label(RichText::new("提示：在顶部「主机」旁点 ＋ 添加 SSH 目标，即可在这里并排查看多台机器。").size(11.5).color(theme::TEXT_MUTED));
         }
     }
 
@@ -2769,31 +3289,24 @@ impl CpuManagerApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("告警阈值").size(12.5).strong().color(theme::TEXT_SEC));
                         ui.add_space(6.0);
-                        ui.label(RichText::new("CPU").size(11.5).color(theme::TEXT_MUTED));
-                        ui.add(egui::Slider::new(&mut self.alert_cpu, 50.0..=100.0).suffix("%"));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("内存").size(11.5).color(theme::TEXT_MUTED));
-                        ui.add(egui::Slider::new(&mut self.alert_mem, 50.0..=100.0).suffix("%"));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("温度").size(11.5).color(theme::TEXT_MUTED));
-                        ui.add(egui::Slider::new(&mut self.alert_temp, 60.0..=95.0).suffix("°C"));
-                    });
-                    let pf = platform::platform();
-                    ui.horizontal(|ui| {
-                        let mut line = format!(
-                            "平台 {} · vcgencmd {} · GPU {} · 指标端点 127.0.0.1:9876",
-                            pf.os,
-                            if pf.has_vcgencmd { "可用" } else { "无" },
-                            if pf.gpu_enabled { "开" } else { "关" }
+                        ui.label(
+                            RichText::new(format!(
+                                "CPU {:.0}% · 内存 {:.0}% · 温度 {:.0}°C",
+                                self.alert_cpu, self.alert_mem, self.alert_temp
+                            ))
+                            .size(11.5)
+                            .color(theme::TEXT_SEC),
                         );
-                        if let Some(os) = self.pi.remote.as_ref().map(|r| r.os.as_str()) {
-                            line.push_str(&format!(" · 远端 {os}（自动探测）"));
+                        if action_btn(ui, "调整", theme::TEXT_SEC, true, false) {
+                            self.settings_open = true;
                         }
-                        ui.label(RichText::new(line).size(10.5).color(theme::TEXT_MUTED));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if action_btn(ui, "配置 platform.conf", theme::TEXT_SEC, true, false) {
-                                self.platform_edit = Some(platform::config_text());
+                            for (n, label) in [(900usize, "15 分钟"), (300, "5 分钟"), (120, "2 分钟")] {
+                                if ui.selectable_label(self.chart_window == n, RichText::new(label).size(11.5)).clicked() {
+                                    self.chart_window = n;
+                                }
                             }
+                            ui.label(RichText::new("时间窗").size(11.0).color(theme::TEXT_MUTED));
                         });
                     });
                 });
@@ -2809,12 +3322,12 @@ impl CpuManagerApp {
             let power = self.pi.power.map(|p| p.core_w).unwrap_or(0.0);
             let gpu_ghz = self.pi.gpu.v3d_ghz.unwrap_or(0.0);
             let gpu_t = self.pi.gpu.temp_c.unwrap_or(0.0);
-            let (gpu_title, gpu_value, gpu_max) = if self.pi.gpu.v3d_ghz.is_some() {
-                ("GPU 频率 (V3D)", format!("{gpu_ghz:.2} GHz"), Some(1.5))
+            let (gpu_title, gpu_value, gpu_max, gpu_unit, gpu_threshold) = if self.pi.gpu.v3d_ghz.is_some() {
+                ("GPU 频率 (V3D)", format!("{gpu_ghz:.2} GHz"), Some(1.5), " GHz", None)
             } else if self.pi.gpu.temp_c.is_some() {
-                ("GPU 温度", format!("{gpu_t:.1}°C"), Some(100.0))
+                ("GPU 温度", format!("{gpu_t:.1}°C"), Some(100.0), "°C", Some(self.alert_temp))
             } else {
-                ("GPU 频率 (V3D)", format!("{gpu_ghz:.2} GHz"), Some(1.5))
+                ("GPU 频率 (V3D)", format!("{gpu_ghz:.2} GHz"), Some(1.5), " GHz", None)
             };
             let power_title = if self.host_sel.is_some() { "整机功耗 (RAPL)" } else { "核心功耗" };
             let disk_r = self.usage.disk_read_bps / 1024.0;
@@ -2830,28 +3343,28 @@ impl CpuManagerApp {
             let net_rx_value = format!("{net_rx:.0} KB/s");
             let net_tx_value = format!("{net_tx:.0} KB/s");
             let temp_heat = theme::temp_color(temp);
-            let h = 74.0;
+            let h = 68.0;
 
             // 大盘：左侧处理器 + 网络，右侧内存显卡 + 磁盘；窄窗口退化为单列。
             let left = |ui: &mut egui::Ui| {
                 dash_card(ui, "处理器", theme::CPU, |ui| {
-                    metric_graph(ui, "CPU 使用率", &cpu_value, theme::CPU, Some(100.0), &self.perf.cpu, h);
-                    metric_graph(ui, "温度", &temp_value, temp_heat, Some(100.0), &self.perf.temp, h);
-                    metric_graph(ui, power_title, &power_value, theme::POWER, None, &self.perf.power, h);
+                    chart(ui, ChartSpec { title: "CPU 使用率", value: &cpu_value, unit: "%", color: theme::CPU, max: Some(100.0), threshold: Some(self.alert_cpu), data: &self.perf.cpu, window: self.chart_window }, h);
+                    chart(ui, ChartSpec { title: "温度", value: &temp_value, unit: "°C", color: temp_heat, max: Some(100.0), threshold: Some(self.alert_temp), data: &self.perf.temp, window: self.chart_window }, h);
+                    chart(ui, ChartSpec { title: power_title, value: &power_value, unit: " W", color: theme::POWER, max: None, threshold: None, data: &self.perf.power, window: self.chart_window }, h);
                 });
                 dash_card(ui, "网络吞吐", theme::SUCCESS, |ui| {
-                    metric_graph(ui, "下行 ↓", &net_rx_value, theme::SUCCESS, None, &self.perf.net_rx, h);
-                    metric_graph(ui, "上行 ↑", &net_tx_value, theme::CPU, None, &self.perf.net_tx, h);
+                    chart(ui, ChartSpec { title: "下行 ↓", value: &net_rx_value, unit: " KB/s", color: theme::SUCCESS, max: None, threshold: None, data: &self.perf.net_rx, window: self.chart_window }, h);
+                    chart(ui, ChartSpec { title: "上行 ↑", value: &net_tx_value, unit: " KB/s", color: theme::CPU, max: None, threshold: None, data: &self.perf.net_tx, window: self.chart_window }, h);
                 });
             };
             let right = |ui: &mut egui::Ui| {
                 dash_card(ui, "内存与显卡", theme::MEM, |ui| {
-                    metric_graph(ui, "内存使用率", &mem_value, theme::MEM, Some(100.0), &self.perf.mem, h);
-                    metric_graph(ui, gpu_title, &gpu_value, theme::GPU, gpu_max, &self.perf.gpu, h);
+                    chart(ui, ChartSpec { title: "内存使用率", value: &mem_value, unit: "%", color: theme::MEM, max: Some(100.0), threshold: Some(self.alert_mem), data: &self.perf.mem, window: self.chart_window }, h);
+                    chart(ui, ChartSpec { title: gpu_title, value: &gpu_value, unit: gpu_unit, color: theme::GPU, max: gpu_max, threshold: gpu_threshold, data: &self.perf.gpu, window: self.chart_window }, h);
                 });
                 dash_card(ui, "磁盘 I/O", theme::INFO, |ui| {
-                    metric_graph(ui, "读取", &disk_r_value, theme::INFO, None, &self.perf.disk_r, h);
-                    metric_graph(ui, "写入", &disk_w_value, theme::WARNING, None, &self.perf.disk_w, h);
+                    chart(ui, ChartSpec { title: "读取", value: &disk_r_value, unit: " KB/s", color: theme::INFO, max: None, threshold: None, data: &self.perf.disk_r, window: self.chart_window }, h);
+                    chart(ui, ChartSpec { title: "写入", value: &disk_w_value, unit: " KB/s", color: theme::WARNING, max: None, threshold: None, data: &self.perf.disk_w, window: self.chart_window }, h);
                 });
             };
             if ui.available_width() >= 760.0 {
@@ -2893,26 +3406,19 @@ impl CpuManagerApp {
     }
 
     fn probe_view(&mut self, ui: &mut egui::Ui) {
-        if let Some(h) = self.host_sel.clone() {
+        let desired = self.host_sel.clone();
+        if self.probe_source != desired {
             if self.probe_armed.is_some() {
                 self.probe_stop();
             }
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("探针目前只在本机运行").size(15.0).strong().color(theme::TEXT));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("当前查看的是远端主机 {h}，该主机上尚未部署探针代理（ftrace/uprobe 需本机内核挂点与本地可执行文件）。"))
-                        .size(12.0)
-                        .color(theme::TEXT_SEC),
-                );
-                ui.label(RichText::new("监控 / 性能 / 调度 / 总览 均已支持远端；切回本地即可使用探针。").size(11.5).color(theme::TEXT_MUTED));
-                ui.add_space(10.0);
-                if action_btn(ui, "切回本地查看探针", theme::INFO, true, false) {
-                    self.select_host(None);
-                }
-            });
-            return;
+            self.probe = None;
+            self.probe_scan_err = None;
+            self.probe_rx = None;
+            self.probe_elf.clear();
+            self.probe_sel = None;
+            self.probe_sel_exe = None;
+            self.probe_source = desired.clone();
+            self.start_probe_load(desired.clone());
         }
         self.probe_agent_tick();
         if self.probe_armed.is_some() {
@@ -2920,27 +3426,63 @@ impl CpuManagerApp {
         }
         if let Some(rx) = &self.probe_rx {
             match rx.try_recv() {
-                Ok(snap) => {
-                    self.probe_uprobe_ok = snap.caps.uprobe_events;
-                    self.probe = Some(snap);
+                Ok((host, result)) => {
                     self.probe_rx = None;
-                    self.probe_sel = None;
-                    self.probe_sel_exe = None;
+                    if host != self.host_sel {
+                        self.probe_source = None;
+                    } else {
+                        match result {
+                            Ok(snap) => {
+                                self.probe_uprobe_ok = snap.caps.uprobe_events;
+                                self.probe = Some(snap);
+                                self.probe_scan_err = None;
+                                self.probe_sel = None;
+                                self.probe_sel_exe = None;
+                            }
+                            Err(e) => {
+                                self.probe = None;
+                                self.probe_scan_err = Some(e);
+                            }
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.probe_rx = None,
             }
         }
         if self.probe.is_none() {
+            if let Some(err) = self.probe_scan_err.clone() {
+                ui.add_space(28.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(format!("扫描失败：{err}")).size(12.5).color(theme::DANGER));
+                    ui.add_space(6.0);
+                    if action_btn(ui, "重试扫描", theme::INFO, true, false) {
+                        let host = self.host_sel.clone();
+                        self.probe_scan_err = None;
+                        self.probe_source = host.clone();
+                        self.start_probe_load(host);
+                    }
+                });
+                return;
+            }
             if self.probe_rx.is_none() {
-                self.start_probe_load();
+                let host = self.host_sel.clone();
+                self.probe_source = host.clone();
+                self.start_probe_load(host);
             }
             ui.add_space(28.0);
             ui.vertical_centered(|ui| {
                 ui.spinner();
                 ui.add_space(6.0);
                 ui.label(RichText::new("正在扫描内核符号与用户态可执行文件…").size(12.5).color(theme::TEXT_SEC));
-                ui.label(RichText::new("读取 /proc/kallsyms 约需 0.1–0.3 秒").size(11.0).color(theme::TEXT_MUTED));
+                ui.label(
+                    RichText::new(match &self.probe_source {
+                        Some(h) => format!("远端 {h} · 经 SSH 读取 /proc/kallsyms"),
+                        None => "读取 /proc/kallsyms 约需 0.1–0.3 秒".to_string(),
+                    })
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+                );
             });
             ui.ctx().request_repaint_after(Duration::from_millis(150));
             return;
@@ -2960,7 +3502,9 @@ impl CpuManagerApp {
             self.probe_elf.clear();
             self.probe_sel = None;
             self.probe_sel_exe = None;
-            self.start_probe_load();
+            let host = self.host_sel.clone();
+            self.probe_source = host.clone();
+            self.start_probe_load(host);
             self.status = "正在重新扫描挂载点…".to_string();
             self.status_error = false;
         } else {
@@ -2968,11 +3512,12 @@ impl CpuManagerApp {
         }
     }
 
-    fn start_probe_load(&mut self) {
+    fn start_probe_load(&mut self, host: Option<remote::SshTarget>) {
         let (tx, rx) = std::sync::mpsc::channel();
         self.probe_rx = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(probe::Snapshot::load());
+            let result = crate::probe_source::snapshot(host.as_ref());
+            let _ = tx.send((host, result));
         });
     }
 
@@ -3046,6 +3591,16 @@ impl CpuManagerApp {
                     badge(ui, "探针", theme::INFO).on_hover_text(format!(
                         "浏览挂载点不需要 root；挂载与命中读取由 root helper 通过 tracefs 完成。\n外部工具链：{tools}"
                     ));
+                    if let Some(h) = &self.probe_source {
+                        badge(ui, &format!("远程 {}", h.as_str()), theme::INFO);
+                    } else {
+                        badge(ui, "本地", theme::TEXT_SEC);
+                    }
+                    badge(
+                        ui,
+                        if snap.helper_ready { "helper 就绪" } else { "helper 未就绪" },
+                        if snap.helper_ready { theme::SUCCESS } else { theme::WARNING },
+                    );
                     cap_badge(ui, "系统调用", c.bpf_syscall).on_hover_text("内核配置 CONFIG_BPF_SYSCALL。");
                     cap_badge(ui, "JIT", c.bpf_jit).on_hover_text("内核配置 CONFIG_BPF_JIT。");
                     cap_badge(ui, "kprobe", c.kprobe_events).on_hover_text("内核配置 CONFIG_KPROBE_EVENTS。");
@@ -3170,6 +3725,16 @@ impl CpuManagerApp {
         }
     }
 
+    fn probe_load_elf(&self, path: &std::path::Path) -> Result<probe::ElfSymbols, String> {
+        match &self.probe_source {
+            Some(host) => {
+                let mut send = |cmd: &str| crate::probe_source::exchange(Some(host), cmd);
+                probeclient::elf_via(&mut send, &path.display().to_string())
+            }
+            None => probe::elf_symbols(path),
+        }
+    }
+
     fn probe_uprobe_table(&mut self, ui: &mut egui::Ui, table_h: f32) {
         let Some(path) = self.probe_sel_exe.clone() else {
             theme::card_frame().show(ui, |ui| {
@@ -3179,7 +3744,7 @@ impl CpuManagerApp {
             });
             return;
         };
-        let parsed = self.probe_elf.remove(&path).unwrap_or_else(|| probe::elf_symbols(&path));
+        let parsed = self.probe_elf.remove(&path).unwrap_or_else(|| self.probe_load_elf(&path));
         let mut clicked: Option<String> = None;
         match &parsed {
             Ok(elf) => {
@@ -3286,7 +3851,9 @@ impl CpuManagerApp {
             return;
         }
         self.probe_poll_at = Instant::now();
-        match probeclient::poll() {
+        let host = self.probe_armed_remote.clone();
+        let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+        match probeclient::poll_via(&mut send) {
             Ok(stats) => {
                 self.probe_hits = stats.total;
                 self.probe_recent = stats.calls;
@@ -3294,6 +3861,7 @@ impl CpuManagerApp {
             }
             Err(e) => {
                 self.probe_armed = None;
+                self.probe_armed_remote = None;
                 self.probe_agent_err = Some(e.clone());
                 self.probe_recent.clear();
                 self.status = format!("读取命中失败：{e}");
@@ -3326,10 +3894,13 @@ impl CpuManagerApp {
             ProbeSel::Uprobe { exe, sym } => ("uprobe", Some(exe.as_path()), sym.as_str()),
         };
         let args = if kind == "syscall" { "" } else { self.probe_args.trim() };
-        let result = probeclient::attach(&probeclient::Attach { kind, target, symbol, stack, pid, args });
+        let host = self.probe_source.clone();
+        let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+        let result = probeclient::attach_via(&mut send, &probeclient::Attach { kind, target, symbol, stack, pid, args });
         match result {
             Ok(()) => {
                 self.probe_armed = Some(sel);
+                self.probe_armed_remote = host;
                 self.probe_armed_stack = stack;
                 self.probe_armed_pid = pid;
                 self.probe_hits = 0;
@@ -3352,13 +3923,20 @@ impl CpuManagerApp {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let (Some(host), Some(pid)) = (self.probe_armed_remote.clone(), self.probe_test_remote_pid.take()) {
+            let limits = remote::ExecLimits { timeout: Duration::from_secs(5), max_output: 4096 };
+            let _ = remote::ssh_exec(&host, &format!("kill {pid} 2>/dev/null || true"), &limits, None);
+        }
         if self.probe_armed.take().is_none() {
+            self.probe_armed_remote = None;
             return;
         }
         self.probe_recent.clear();
         self.probe_hits = 0;
         self.probe_armed_pid = None;
-        match probeclient::detach() {
+        let host = self.probe_armed_remote.take();
+        let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+        match probeclient::detach_via(&mut send) {
             Ok(()) => {
                 self.status = "探针已停止".to_string();
                 self.status_error = false;
@@ -3381,6 +3959,7 @@ impl CpuManagerApp {
         };
         let armed = self.probe_armed.is_some();
         let uprobe_blocked = matches!(&self.probe_sel, Some(ProbeSel::Uprobe { .. })) && self.probe_uprobe_ok == Some(false);
+        let helper_hint = probe_helper_hint(self.probe_source.as_ref());
         let mut copy_attach = false;
         let mut copy_hint = false;
         let mut start = false;
@@ -3429,12 +4008,12 @@ impl CpuManagerApp {
                         ui.horizontal_wrapped(|ui| {
                             if !is_syscall {
                                 ui.label(RichText::new("参数").size(11.0).color(theme::TEXT_MUTED)).on_hover_text(
-                                    "tracefs fetchargs，留空默认抓 x0–x7。示例：arg0=%x0 arg1=+0(%x1):string",
+                                    "tracefs fetchargs；留空按架构抓 ABI 参数寄存器（arm64 x0–x7 / x86_64 di,si,dx,cx,r8,r9）。示例：arm64 arg0=%x0；x86_64 arg0=%di",
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.probe_args)
                                         .id(egui::Id::unique("probe_args"))
-                                        .hint_text("arg0=%x0 arg1=+0(%x1):string")
+                                        .hint_text("arm64: arg0=%x0 · x86_64: arg0=%di")
                                         .desired_width(250.0),
                                 );
                             }
@@ -3497,7 +4076,7 @@ impl CpuManagerApp {
                             if action_btn(ui, "复制安装命令", theme::INFO, true, false) {
                                 copy_hint = true;
                             }
-                            ui.label(RichText::new(helper_install_hint()).size(10.5).monospace().color(theme::TEXT_MUTED));
+                            ui.label(RichText::new(helper_hint.as_str()).size(10.5).monospace().color(theme::TEXT_MUTED));
                         }
                     });
                 } else if uprobe_blocked {
@@ -3516,7 +4095,7 @@ impl CpuManagerApp {
             self.status_error = false;
         }
         if copy_hint {
-            ui.ctx().copy_text(helper_install_hint());
+            ui.ctx().copy_text(helper_hint.clone());
             self.status = "已复制安装命令".to_string();
             self.status_error = false;
         }
@@ -3534,6 +4113,39 @@ impl CpuManagerApp {
     fn probe_run_test(&mut self) {
         let cmd = self.probe_test_cmd.trim().to_string();
         if cmd.is_empty() || self.probe_sel.is_none() {
+            return;
+        }
+        if let Some(host) = self.probe_source.clone() {
+            let inner = format!("sleep 1; exec {cmd}");
+            let script = format!("nohup sh -c {} >/dev/null 2>&1 & echo $!", shell_quote(&inner));
+            let limits = remote::ExecLimits { timeout: Duration::from_secs(8), max_output: 64 * 1024 };
+            let out = match remote::ssh_exec(&host, &script, &limits, None) {
+                Ok(out) => out,
+                Err(e) => {
+                    self.probe_agent_err = Some(format!("启动远端测试命令失败：{e}"));
+                    self.status = format!("启动远端测试命令失败：{e}");
+                    self.status_error = true;
+                    return;
+                }
+            };
+            let pid = out.stdout.trim().parse::<u32>().unwrap_or(0);
+            if pid == 0 {
+                self.probe_agent_err = Some("远端测试命令没有返回 PID".to_string());
+                self.status = "远端测试命令没有返回 PID".to_string();
+                self.status_error = true;
+                return;
+            }
+            self.probe_stop();
+            self.probe_pid = pid.to_string();
+            self.probe_test_remote_pid = Some(pid);
+            self.probe_start();
+            if self.probe_armed.is_some() {
+                self.status = format!("远端测试命令已启动（PID {pid}），等待命中…");
+                self.status_error = false;
+            } else {
+                let _ = remote::ssh_exec(&host, &format!("kill {pid} 2>/dev/null || true"), &limits, None);
+                self.probe_test_remote_pid = None;
+            }
             return;
         }
         if let Some(mut child) = self.probe_test_child.take() {
@@ -3628,12 +4240,79 @@ impl CpuManagerApp {
                 let (dot, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 3.0, color);
                 ui.label(RichText::new(self.status.as_str()).size(12.0).color(color));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let age = self.last_sample.elapsed().as_secs_f32();
+                    let paused = if self.paused { "已暂停 · " } else { "" };
+                    ui.label(
+                        RichText::new(format!("{paused}采样 {:.1}s · {age:.1}s 前更新", self.interval))
+                            .size(11.0)
+                            .monospace()
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
             });
             ui.add_space(6.0);
         });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.settings_open {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("设置").size(17.0).strong().color(theme::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if action_btn(ui, "关闭", theme::TEXT_SEC, true, false) {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.label(RichText::new("告警阈值").size(12.5).strong().color(theme::TEXT_SEC));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("CPU").size(11.5).color(theme::TEXT_MUTED));
+                    ui.add(egui::Slider::new(&mut self.alert_cpu, 50.0..=100.0).suffix("%"));
+                    ui.label(RichText::new("内存").size(11.5).color(theme::TEXT_MUTED));
+                    ui.add(egui::Slider::new(&mut self.alert_mem, 50.0..=100.0).suffix("%"));
+                    ui.label(RichText::new("温度").size(11.5).color(theme::TEXT_MUTED));
+                    ui.add(egui::Slider::new(&mut self.alert_temp, 60.0..=95.0).suffix("°C"));
+                });
+                ui.separator();
+                ui.checkbox(&mut self.dash_open, RichText::new("监控页默认展开 KPI 大盘").size(12.5));
+                ui.label(RichText::new(format!("采样间隔 {:.1} 秒（在顶部导航「间隔」处调整）", self.interval)).size(11.5).color(theme::TEXT_MUTED));
+                ui.separator();
+                ui.label(RichText::new("平台与采集").size(12.5).strong().color(theme::TEXT_SEC));
+                let pf = platform::platform();
+                ui.label(
+                    RichText::new(format!(
+                        "平台 {} · vcgencmd {} · GPU {} · 指标端点 127.0.0.1:9876",
+                        pf.os,
+                        if pf.has_vcgencmd { "可用" } else { "无" },
+                        if pf.gpu_enabled { "开" } else { "关" }
+                    ))
+                    .size(11.0)
+                    .color(theme::TEXT_SEC),
+                );
+                ui.horizontal(|ui| {
+                    if action_btn(ui, "编辑 platform.conf", theme::INFO, true, false) {
+                        self.platform_edit = Some(platform::config_text());
+                        close = true;
+                    }
+                    ui.label(RichText::new("配置：~/.config/system-monitor/config.conf").size(10.5).color(theme::TEXT_MUTED));
+                });
+                ui.add_space(2.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if action_btn(ui, "完成", theme::SUCCESS, true, false) {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.settings_open = false;
+            }
+        }
         // 先拷贝数据，避免 Modal 闭包内 &mut self 与借用冲突
         let confirm = self.confirm.as_ref().map(|c| (c.kind, c.pid, c.comm.clone(), c.cmdline.clone(), c.tree));
         if let Some((kind, pid, comm, cmdline, tree)) = confirm {
@@ -3976,6 +4655,7 @@ impl eframe::App for CpuManagerApp {
             self.central(ui);
         }
         self.dialogs(ui.ctx());
+        self.show_toast(ui.ctx());
         self.persist_if_changed();
         ui.ctx().request_repaint_after(Duration::from_secs_f32(self.interval));
     }
@@ -4015,14 +4695,50 @@ fn nav_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
             painter.rect_filled(rect, 8.0, theme::ELEVATED);
         }
         painter.galley(rect.center() - galley.size() * 0.5, galley, color);
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(2.0), 9.0, Stroke::new(1.5, theme::CPU), egui::StrokeKind::Outside);
+        }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 总览页主机指标：标签 + 数值 + 细进度条。
+fn host_metric(ui: &mut egui::Ui, label: &str, value: &str, frac: f32, color: Color32) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).size(10.0).color(theme::TEXT_MUTED));
+            ui.label(RichText::new(value).size(12.0).monospace().strong().color(color));
+        });
+        ui.add(egui::ProgressBar::new(frac).desired_width(118.0).desired_height(4.0).fill(color).corner_radius(2));
+    });
 }
 
 /// 细指标条里的一对「标签 + 数值」。
 fn vital(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     ui.label(RichText::new(label).size(10.5).color(theme::TEXT_MUTED));
     ui.label(RichText::new(value).size(12.0).monospace().strong().color(color));
+}
+
+/// 与当前历史窗口起点相比的变化量（窗口默认 120 个采样）。
+fn trend_delta(data: &VecDeque<f32>) -> Option<f32> {
+    if data.len() < 2 {
+        return None;
+    }
+    Some(*data.back()? - *data.front()?)
+}
+
+/// 环比趋势小字：上升琥珀、下降绿色、几乎不变为“持平”。
+fn delta_chip(ui: &mut egui::Ui, d: f32, unit: &str, decimals: usize) {
+    let (arrow, color, text) = if d.abs() < 0.05 {
+        ("·", theme::TEXT_MUTED, "持平".to_string())
+    } else if d > 0.0 {
+        ("▲", theme::WARNING, format!("{:.*}{unit}", decimals, d.abs()))
+    } else {
+        ("▼", theme::SUCCESS, format!("{:.*}{unit}", decimals, d.abs()))
+    };
+    ui.label(RichText::new(format!("{arrow} {text}")).size(10.0).monospace().color(color))
+        .on_hover_text("与当前历史窗口起点相比（约 2 分钟，含启动前载入的历史）");
 }
 
 /// 指标摘要块：淡色底 + 小标签 + 大数值，用于网络页等页头。
@@ -4089,6 +4805,75 @@ fn icontains(hay: &str, needle: &str) -> bool {
     hay.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
+/// 进程表列元信息：标题、宽（0=自适应）、可排序字段、是否右对齐。
+fn col_meta(c: ProcCol) -> (&'static str, f32, Option<SortCol>, bool) {
+    match c {
+        ProcCol::Pid => ("PID", 72.0, Some(SortCol::Pid), false),
+        ProcCol::Ppid => ("PPID", 56.0, Some(SortCol::Ppid), true),
+        ProcCol::Name => ("名称", 0.0, Some(SortCol::Name), false),
+        ProcCol::User => ("用户", 96.0, Some(SortCol::User), false),
+        ProcCol::Cpu => ("CPU%", 84.0, Some(SortCol::Cpu), true),
+        ProcCol::Rss => ("内存MB", 84.0, Some(SortCol::Mem), true),
+        ProcCol::MemPct => ("内存%", 76.0, Some(SortCol::MemPct), true),
+        ProcCol::Io => ("磁盘 I/O", 96.0, None, true),
+        ProcCol::Fd => ("FD", 54.0, None, true),
+        ProcCol::Nice => ("nice", 60.0, Some(SortCol::Nice), true),
+        ProcCol::State => ("状态", 80.0, Some(SortCol::State), false),
+    }
+}
+
+/// 进程筛选：空格分隔多个条件（AND）。
+/// 支持 `user:x`、`state:R`、`name:x`，以及 `cpu>50`、`mem>2`、`rss>100`、`nice<0`。
+fn proc_matches(p: &ProcUsage, query: &str) -> bool {
+    query.split_whitespace().all(|tok| proc_token_matches(p, tok))
+}
+
+fn proc_token_matches(p: &ProcUsage, tok: &str) -> bool {
+    if let Some((k, v)) = tok.split_once(':') {
+        let v = v.trim();
+        match k.to_ascii_lowercase().as_str() {
+            "user" | "u" => return icontains(&p.user, v),
+            "name" | "comm" => return icontains(&p.comm, v),
+            "state" | "s" => return v.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&p.state)),
+            "pid" => return p.pid.to_string().contains(v),
+            _ => {}
+        }
+    }
+    if let Some((k, op, v)) = split_cmp(tok)
+        && let Ok(n) = v.trim().parse::<f32>()
+    {
+        let key = k.to_ascii_lowercase();
+        let left = match key.as_str() {
+            "cpu" => p.cpu_percent,
+            "mem" | "mempct" => p.mem_percent,
+            "rss" => p.rss_kb as f32 / 1024.0,
+            "nice" => p.nice as f32,
+            "pid" => p.pid as f32,
+            _ => f32::NAN,
+        };
+        if !left.is_nan() {
+            return match op {
+                ">=" => left >= n,
+                "<=" => left <= n,
+                ">" => left > n,
+                "<" => left < n,
+                _ => false,
+            };
+        }
+    }
+    icontains(&p.comm, tok) || p.pid.to_string().contains(tok)
+}
+
+fn split_cmp(tok: &str) -> Option<(&str, &str, &str)> {
+    for op in [">=", "<=", ">", "<"] {
+        if let Some(idx) = tok.find(op) {
+            let (k, rest) = tok.split_at(idx);
+            return Some((k, op, &rest[op.len()..]));
+        }
+    }
+    None
+}
+
 fn cap_badge(ui: &mut egui::Ui, label: &str, ok: Option<bool>) -> egui::Response {
     let (mark, color) = match ok {
         Some(true) => ("✓", theme::SUCCESS),
@@ -4135,6 +4920,20 @@ fn format_age(secs: f32) -> String {
     } else {
         format!("{:.1} 小时", secs / 3600.0)
     }
+}
+
+fn probe_helper_hint(host: Option<&remote::SshTarget>) -> String {
+    match host {
+        Some(h) => format!(
+            "ssh {} 'cd <system-monitor 仓库> && sudo scripts/install-probe-helper.sh'",
+            h.as_str()
+        ),
+        None => helper_install_hint(),
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn helper_install_hint() -> String {
@@ -4323,6 +5122,9 @@ fn action_btn(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool, fil
     if enabled && resp.hovered() {
         ui.painter().rect_filled(resp.rect, 7.0, Color32::from_white_alpha(12));
     }
+    if resp.has_focus() {
+        ui.painter().rect_stroke(resp.rect.expand(2.0), 8.0, Stroke::new(1.5, theme::CPU), egui::StrokeKind::Outside);
+    }
     resp.clicked()
 }
 
@@ -4399,52 +5201,130 @@ fn sparkline_of(
     }
 }
 
-fn metric_graph(
-    ui: &mut egui::Ui,
-    title: &str,
-    value: &str,
+struct ChartSpec<'a> {
+    title: &'a str,
+    value: &'a str,
+    unit: &'a str,
     color: Color32,
-    fixed_max: Option<f32>,
-    data: &VecDeque<f32>,
-    height: f32,
-) {
+    max: Option<f32>,
+    threshold: Option<f32>,
+    data: &'a VecDeque<f32>,
+    /// 只显示最近 N 个采样。
+    window: usize,
+}
+
+fn fmt_tick(v: f32, unit: &str) -> String {
+    match unit {
+        "%" => format!("{v:.0}%"),
+        " W" => format!("{v:.1}W"),
+        "°C" => format!("{v:.0}°"),
+        " GHz" => format!("{v:.2}"),
+        " KB/s" => {
+            if v >= 1024.0 {
+                format!("{:.1}M", v / 1024.0)
+            } else {
+                format!("{v:.0}K")
+            }
+        }
+        _ => format!("{v:.0}"),
+    }
+}
+
+/// 趋势图：Y 轴刻度 + 面积填充 + 阈值虚线 + 悬停竖线与数值读数（含均值/峰值）。
+fn chart(ui: &mut egui::Ui, spec: ChartSpec<'_>, height: f32) {
+    let ChartSpec { title, value, unit, color, max: fixed_max, threshold, data, window } = spec;
+    let series: Vec<f32> = data.iter().skip(data.len().saturating_sub(window.max(2))).copied().collect();
     let width = ui.available_width().max(120.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 8.0, theme::EXTREME);
-    let max = fixed_max.unwrap_or_else(|| data.iter().cloned().fold(1.0_f32, f32::max).max(1.0));
+    let max = fixed_max.unwrap_or_else(|| series.iter().copied().fold(1.0_f32, f32::max).max(1.0));
+    let plot_left = rect.left() + 38.0;
+    let plot_right = rect.right() - 6.0;
+    let plot_top = rect.top() + 24.0;
+    let plot_bottom = rect.bottom() - 6.0;
     for f in [0.25_f32, 0.5, 0.75] {
-        let y = rect.bottom() - 6.0 - (height - 24.0) * f;
-        painter.line_segment(
-            [Pos2::new(rect.left() + 6.0, y), Pos2::new(rect.right() - 6.0, y)],
-            Stroke::new(1.0, theme::BORDER),
+        let y = plot_bottom - (plot_bottom - plot_top) * f;
+        painter.line_segment([Pos2::new(plot_left, y), Pos2::new(plot_right, y)], Stroke::new(1.0, theme::BORDER));
+    }
+    for f in [0.0_f32, 0.5, 1.0] {
+        let y = plot_bottom - (plot_bottom - plot_top) * f;
+        painter.text(
+            Pos2::new(plot_left - 4.0, y),
+            egui::Align2::RIGHT_CENTER,
+            fmt_tick(max * f, unit),
+            egui::FontId::monospace(9.5),
+            theme::TEXT_MUTED,
         );
     }
-    let n = data.len();
+    if let Some(th) = threshold
+        && th > 0.0
+        && th <= max
+    {
+        let y = plot_bottom - (plot_bottom - plot_top) * (th / max).clamp(0.0, 1.0);
+        let warning = theme::tint(theme::WARNING, 0.7);
+        let mut x = plot_left;
+        while x < plot_right {
+            painter.line_segment([Pos2::new(x, y), Pos2::new((x + 5.0).min(plot_right), y)], Stroke::new(1.0, warning));
+            x += 9.0;
+        }
+        painter.text(
+            Pos2::new(plot_left + 4.0, y + 1.0),
+            egui::Align2::LEFT_TOP,
+            format!("阈值 {th:.0}{unit}"),
+            egui::FontId::proportional(9.5),
+            theme::TEXT_MUTED,
+        );
+    }
+    let n = series.len();
+    let mut tip = None;
     if n >= 2 {
-        let plot_top = rect.top() + 20.0;
-        let plot_bottom = rect.bottom() - 6.0;
-        let pts: Vec<Pos2> = data
+        let pts: Vec<Pos2> = series
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let x = rect.left() + 6.0 + (width - 12.0) * (i as f32 / (n - 1) as f32);
+                let x = plot_left + (plot_right - plot_left) * (i as f32 / (n - 1) as f32);
                 let frac = (v / max).clamp(0.0, 1.0);
                 let y = plot_bottom - (plot_bottom - plot_top) * frac;
                 Pos2::new(x, y)
             })
             .collect();
         let fill = theme::lerp_color(theme::EXTREME, color, 0.20);
-        let dx = ((width - 12.0) / (n - 1) as f32).max(1.0);
+        let dx = ((plot_right - plot_left) / (n - 1) as f32).max(1.0);
         for p in &pts {
             painter.line_segment([Pos2::new(p.x, plot_bottom), *p], Stroke::new(dx, fill));
         }
         for pair in pts.windows(2) {
             painter.line_segment([pair[0], pair[1]], Stroke::new(1.6, color));
         }
+        if let Some(last) = pts.last() {
+            painter.circle_filled(*last, 2.2, color);
+        }
+        if let Some(pos) = resp.hover_pos()
+            && (plot_left..=plot_right).contains(&pos.x)
+        {
+            let t = ((pos.x - plot_left) / (plot_right - plot_left)).clamp(0.0, 1.0);
+            let idx = ((t * (n - 1) as f32).round() as usize).min(n - 1);
+            let p = pts[idx];
+            painter.line_segment([Pos2::new(p.x, plot_top), Pos2::new(p.x, plot_bottom)], Stroke::new(1.0, theme::tint(color, 0.6)));
+            painter.circle_filled(p, 3.2, theme::EXTREME);
+            painter.circle_stroke(p, 3.2, Stroke::new(1.4, color));
+            let v = series[idx];
+            let avg = series.iter().sum::<f32>() / n as f32;
+            let peak = series.iter().copied().fold(f32::MIN, f32::max);
+            tip = Some(format!(
+                "{title}  {v:.1}{unit}\n均值 {avg:.1}{unit} · 峰值 {peak:.1}{unit}\n{} 个采样前",
+                n - 1 - idx
+            ));
+        }
+    } else {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "采集中…", egui::FontId::proportional(10.5), theme::TEXT_MUTED);
     }
     painter.text(rect.left_top() + egui::vec2(8.0, 5.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(12.0), theme::TEXT_SEC);
     painter.text(rect.right_top() + egui::vec2(-8.0, 5.0), egui::Align2::RIGHT_TOP, value, egui::FontId::monospace(13.0), color);
+    if let Some(t) = tip {
+        resp.on_hover_text(t);
+    }
 }
 
 fn sort_col_key(c: SortCol) -> &'static str {
@@ -4535,7 +5415,32 @@ fn step_pid(pids: &[i32], current: Option<i32>, down: bool) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{icontains, step_pid, thousands};
+    use super::{icontains, proc_matches, step_pid, thousands};
+    use monitor_linux::procstats::ProcUsage;
+
+    #[test]
+    fn proc_filter_syntax() {
+        let p = ProcUsage {
+            pid: 42,
+            ppid: 1,
+            uid: 1000,
+            comm: "node".into(),
+            user: "zhangyi".into(),
+            cpu_percent: 62.5,
+            nice: -5,
+            state: 'R',
+            rss_kb: 2048 * 1024,
+            mem_percent: 3.2,
+        };
+        assert!(proc_matches(&p, ""));
+        assert!(proc_matches(&p, "node"));
+        assert!(proc_matches(&p, "USER:zhang"));
+        assert!(proc_matches(&p, "state:r"));
+        assert!(proc_matches(&p, "cpu>50 state:R"));
+        assert!(!proc_matches(&p, "cpu>70"));
+        assert!(proc_matches(&p, "nice<0 mem>2"));
+        assert!(proc_matches(&p, "42"));
+    }
 
     #[test]
     fn thousands_grouping() {

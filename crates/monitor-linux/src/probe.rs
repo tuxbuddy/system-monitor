@@ -58,6 +58,7 @@ pub struct Caps {
     pub tools: Vec<(&'static str, bool)>,
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub kernel_release: String,
     pub functions: Vec<Symbol>,
@@ -67,6 +68,8 @@ pub struct Snapshot {
     pub errors: Vec<String>,
     pub loaded_at: Instant,
     pub sweep_ms: u128,
+    /// root probe-helper 是否就绪（本地 socket 或远端 SSH 链路）。
+    pub helper_ready: bool,
 }
 
 impl Snapshot {
@@ -102,7 +105,129 @@ impl Snapshot {
             errors,
             loaded_at: Instant::now(),
             sweep_ms: start.elapsed().as_millis(),
+            helper_ready: false,
         }
+    }
+
+    /// 从远端扫描结果组装快照（kallsyms/config/能力/exe 列表由 SSH 取得）。
+    pub fn from_parts(
+        kernel_release: String,
+        kallsyms: &str,
+        uprobes: Vec<UprobeTarget>,
+        caps: Caps,
+        errors: Vec<String>,
+        helper_ready: bool,
+        sweep_ms: u128,
+    ) -> Self {
+        let (functions, syscalls) = split_kallsyms(kallsyms);
+        Self {
+            kernel_release,
+            functions,
+            syscalls,
+            uprobes,
+            caps,
+            errors,
+            loaded_at: Instant::now(),
+            sweep_ms,
+            helper_ready,
+        }
+    }
+}
+
+/// 解析远端 `pid|path` 列表为 uprobe 目标（按路径去重计数）。
+pub fn uprobes_from_list(exes: &[(i32, String)]) -> Vec<UprobeTarget> {
+    let mut map: HashMap<PathBuf, (usize, i32)> = HashMap::new();
+    for (pid, path) in exes {
+        if path.ends_with(" (deleted)") {
+            continue;
+        }
+        map.entry(PathBuf::from(path)).and_modify(|e| e.0 += 1).or_insert((1, *pid));
+    }
+    let mut out: Vec<UprobeTarget> = map
+        .into_iter()
+        .map(|(path, (procs, sample_pid))| UprobeTarget { path, procs, sample_pid })
+        .collect();
+    out.sort_by(|a, b| b.procs.cmp(&a.procs).then_with(|| a.path.cmp(&b.path)));
+    out
+}
+
+/// 远端能力：SSH 用户视角的 tracefs/BPF 状态 + 内核配置。
+#[allow(clippy::too_many_arguments)]
+pub fn caps_from_scan(
+    config: &str,
+    euid: u32,
+    cap_eff: u64,
+    tracefs_readable: bool,
+    kprobe_events_writable: bool,
+    debugfs_readable: bool,
+    btf_file: bool,
+    unprivileged_bpf_disabled: Option<u32>,
+    tools: &[(String, bool)],
+) -> Caps {
+    Caps {
+        euid,
+        bpf_syscall: cfg_flag(config, "CONFIG_BPF_SYSCALL"),
+        bpf_jit: cfg_flag(config, "CONFIG_BPF_JIT"),
+        kprobe_events: cfg_flag(config, "CONFIG_KPROBE_EVENTS"),
+        uprobe_events: cfg_flag(config, "CONFIG_UPROBE_EVENTS"),
+        btf_file,
+        unprivileged_bpf_disabled,
+        cap_bpf: cap_eff & (1 << 39) != 0,
+        cap_perfmon: cap_eff & (1 << 38) != 0,
+        tracefs_readable,
+        kprobe_events_writable,
+        debugfs_readable,
+        tools: TOOLS
+            .iter()
+            .map(|t| (*t, tools.iter().any(|(n, ok)| n == t && *ok)))
+            .collect(),
+    }
+}
+
+/// helper 的 `elf <path>` 回复解析（远端 uprobe 符号表）。
+pub fn parse_elf_reply(text: &str) -> Result<ElfSymbols, String> {
+    let mut source = "未知";
+    let mut stripped = false;
+    let mut symbols = Vec::new();
+    let mut saw_elf = false;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.first().copied() {
+            Some("ELF") if f.len() >= 4 => {
+                saw_elf = true;
+                source = static_source(f[1]);
+                stripped = f[2] == "1";
+            }
+            Some("SYM") if f.len() >= 6 => {
+                let off = if f[4] == "-" {
+                    None
+                } else {
+                    u64::from_str_radix(f[4].trim_start_matches("0x"), 16).ok()
+                };
+                symbols.push(ElfSym {
+                    name: f[1].to_string(),
+                    addr: f[2].parse().unwrap_or(0),
+                    size: f[3].parse().unwrap_or(0),
+                    global: f[5] == "1",
+                    off,
+                });
+            }
+            _ => {}
+        }
+    }
+    if !saw_elf {
+        return Err("helper 未返回 ELF 头".to_string());
+    }
+    Ok(ElfSymbols { symbols, source, stripped })
+}
+
+fn static_source(s: &str) -> &'static str {
+    match s {
+        "symtab" => "symtab",
+        "dynsym" => "dynsym",
+        "symtab + dynsym" => "symtab + dynsym",
+        "无" => "无",
+        _ => "未知",
     }
 }
 
@@ -421,7 +546,7 @@ fn read_caps(release: &str) -> Caps {
     }
 }
 
-fn cfg_flag(text: &str, key: &str) -> Option<bool> {
+pub fn cfg_flag(text: &str, key: &str) -> Option<bool> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(key)
             && let Some(v) = rest.strip_prefix('=')
@@ -543,6 +668,42 @@ mod tests {
                 assert!(off < len, "offset {off:#x} out of file");
             }
         }
+    }
+
+    #[test]
+    fn parses_helper_elf_reply() {
+        let text = "ELF\tsymtab + dynsym\t0\t2\nSYM\tmain\t0x1000\t16\t0x800\t1\nSYM\tlocal\t0x2000\t8\t-\t0\nEND\n";
+        let elf = parse_elf_reply(text).unwrap();
+        assert_eq!(elf.source, "symtab + dynsym");
+        assert!(!elf.stripped);
+        assert_eq!(elf.symbols.len(), 2);
+        assert_eq!(elf.symbols[0].off, Some(0x800));
+        assert_eq!(elf.symbols[1].off, None);
+    }
+
+    #[test]
+    fn remote_parts_and_uprobes() {
+        let exes = vec![(1, "/usr/bin/ls".to_string()), (2, "/usr/bin/ls".to_string()), (3, "/opt/x".to_string())];
+        let ups = uprobes_from_list(&exes);
+        assert_eq!(ups[0].path, PathBuf::from("/usr/bin/ls"));
+        assert_eq!(ups[0].procs, 2);
+        let caps = caps_from_scan(
+            "CONFIG_BPF_SYSCALL=y\n# CONFIG_DEBUG_INFO_BTF is not set\n",
+            1000,
+            0,
+            false,
+            false,
+            true,
+            false,
+            Some(2),
+            &[("perf".to_string(), true)],
+        );
+        assert_eq!(caps.bpf_syscall, Some(true));
+        assert!(!caps.btf_file);
+        assert!(caps.tools.iter().any(|(n, ok)| *n == "perf" && *ok));
+        let snap = Snapshot::from_parts("6.8.0".into(), "0000000000000000 T vfs_read\n", ups, caps, vec![], true, 3);
+        assert!(snap.functions.iter().any(|s| s.name == "vfs_read"));
+        assert!(snap.helper_ready);
     }
 
     #[test]

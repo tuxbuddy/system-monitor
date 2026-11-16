@@ -37,6 +37,17 @@ impl RiskLevel {
             Self::L3 => "L3",
         }
     }
+
+    /// 解析分级字符串（会话持久化恢复用）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "L0" => Some(Self::L0),
+            "L1" => Some(Self::L1),
+            "L2" => Some(Self::L2),
+            "L3" => Some(Self::L3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,6 +132,58 @@ fn base_risk(tool: &str) -> RiskLevel {
     }
 }
 
+/// 全部已知工具及其基础风险（`policy_status` 与 tools/list 的共同来源）。
+/// 参数敏感工具的升级规则见 [`risk_of`]。
+pub fn catalog() -> &'static [(&'static str, RiskLevel)] {
+    &[
+        // L0 纯读取
+        ("policy_status", RiskLevel::L0),
+        ("hosts_list", RiskLevel::L0),
+        ("system_overview", RiskLevel::L0),
+        ("system_load", RiskLevel::L0),
+        ("process_list", RiskLevel::L0),
+        ("process_details", RiskLevel::L0),
+        ("host_capabilities", RiskLevel::L0),
+        ("network_connections", RiskLevel::L0),
+        ("filesystems", RiskLevel::L0),
+        // L1 诊断/会话簿记
+        ("host_use", RiskLevel::L1),
+        ("scheduler_groups", RiskLevel::L1),
+        ("scheduler_status", RiskLevel::L1),
+        ("psi_status", RiskLevel::L1),
+        ("ebpf_doctor", RiskLevel::L1),
+        ("probe_status", RiskLevel::L1),
+        ("probe_search", RiskLevel::L1),
+        ("probe_poll", RiskLevel::L1),
+        ("diag_start", RiskLevel::L1),
+        ("diag_add_evidence", RiskLevel::L1),
+        ("diag_submit_plan", RiskLevel::L1),
+        ("diag_approve", RiskLevel::L1),
+        ("diag_execute", RiskLevel::L1),
+        ("diag_verify", RiskLevel::L1),
+        ("diag_status", RiskLevel::L1),
+        ("diag_abort", RiskLevel::L1),
+        // L2 可恢复控制
+        ("process_nice", RiskLevel::L2),
+        ("scheduler_set_limit", RiskLevel::L2),
+        ("probe_attach", RiskLevel::L2),
+        ("probe_detach", RiskLevel::L2),
+        // 参数敏感：基础 L2，KILL/tree/delete 由 risk_of 升级为 L3
+        ("process_signal", RiskLevel::L2),
+        ("scheduler_group_action", RiskLevel::L2),
+    ]
+}
+
+/// 本地数据目录（审计、审批消费记录、诊断会话）。
+pub fn data_dir() -> Option<PathBuf> {
+    // SM_HOME 仅供测试隔离：把状态文件指到临时目录，不碰真实用户数据
+    let home = match std::env::var_os("SM_HOME") {
+        Some(h) => h,
+        None => std::env::var_os("HOME")?,
+    };
+    Some(PathBuf::from(home).join(".local/share/system-monitor"))
+}
+
 /// 结合参数计算实际风险：KILL / 进程树 / 删除分组升级为 L3。
 pub fn risk_of(tool: &str, args: &Value) -> RiskLevel {
     match tool {
@@ -163,15 +226,6 @@ fn canonical_params(args: &Value) -> String {
         }
     }
     serde_json::to_string(&norm(args)).unwrap_or_else(|_| "{}".to_string())
-}
-
-fn data_dir() -> Option<PathBuf> {
-    // SM_HOME 仅供测试隔离：把状态文件指到临时目录，不碰真实用户数据
-    let home = match std::env::var_os("SM_HOME") {
-        Some(h) => h,
-        None => std::env::var_os("HOME")?,
-    };
-    Some(PathBuf::from(home).join(".local/share/system-monitor"))
 }
 
 fn audit_path() -> Option<PathBuf> {

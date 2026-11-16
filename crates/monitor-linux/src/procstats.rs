@@ -288,6 +288,8 @@ pub struct NetConn {
     pub remote: String,
     pub state: String,
     pub uid: u32,
+    /// /proc/net/* 中的 socket inode；用于本地反查持有进程。
+    pub inode: Option<u64>,
 }
 
 fn decode_addr(hex: &str) -> String {
@@ -338,6 +340,7 @@ pub fn parse_proc_net(text: &str, proto: &str) -> Vec<NetConn> {
             remote: decode_addr(f[2]),
             state: tcp_state(f[3]).to_string(),
             uid: f[7].parse().unwrap_or(0),
+            inode: f.get(9).and_then(|s| s.parse().ok()),
         });
     }
     out
@@ -931,6 +934,64 @@ impl Sampler {
     }
 }
 
+/// 进程 I/O 与 FD 概览（按需采集，不进入每秒采样主路径）。
+#[derive(Clone, Debug)]
+pub struct ProcExtra {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub fds: u64,
+}
+
+fn parse_io_field(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(str::trim))
+        .and_then(|v| v.parse().ok())
+}
+
+pub fn read_proc_extra(pid: i32) -> Option<ProcExtra> {
+    let io = fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    let read_bytes = parse_io_field(&io, "read_bytes")?;
+    let write_bytes = parse_io_field(&io, "write_bytes")?;
+    let fds = fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count() as u64;
+    Some(ProcExtra { read_bytes, write_bytes, fds })
+}
+
+/// socket inode → (pid, comm)：扫描 /proc/<pid>/fd 的 socket:[inode] 软链。
+/// 仅本地有效；由调用方限制刷新频率，避免每帧扫描。
+pub fn socket_owners() -> HashMap<u64, (i32, String)> {
+    let mut out = HashMap::new();
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for p in procs.flatten() {
+        let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        let mut comm: Option<String> = None;
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(rest) = target.to_str().and_then(|s| s.strip_prefix("socket:[")) else {
+                continue;
+            };
+            let Some(inode) = rest.strip_suffix(']').and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let name = comm.get_or_insert_with(|| {
+                fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
+            });
+            out.insert(inode, (pid, name.clone()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1376,14 @@ tmpfs               1000000        1    999999       1% /run\n\
         assert_eq!(c[0].remote, "0.0.0.0:0");
         assert_eq!(c[0].state, "LISTEN");
         assert_eq!(c[0].uid, 1000);
+        assert_eq!(c[0].inode, Some(12345));
         assert_eq!(c[1].state, "ESTABLISHED");
+    }
+
+    #[test]
+    fn read_proc_extra_for_self() {
+        let pid = std::process::id() as i32;
+        let e = read_proc_extra(pid).expect("self /proc/<pid>/io 可读");
+        assert!(e.fds >= 2);
     }
 }

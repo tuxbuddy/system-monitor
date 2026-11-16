@@ -3,6 +3,7 @@
 pub mod diagnose;
 pub mod mcp;
 pub mod metrics;
+pub mod probe_source;
 pub mod scheduler;
 pub mod service;
 pub mod tui;

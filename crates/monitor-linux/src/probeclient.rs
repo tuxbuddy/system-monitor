@@ -6,6 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::probe;
+
 pub const SOCKET: &str = "/run/system-monitor-probe/probe.sock";
 const TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -34,6 +36,11 @@ pub struct Stats {
 }
 
 pub fn attach(opts: &Attach<'_>) -> Result<(), String> {
+    attach_via(&mut |cmd| exchange(cmd), opts)
+}
+
+/// 传给任意传输层（本地 UnixSocket / 远端 SSH）的挂载命令。
+pub fn attach_command(opts: &Attach<'_>) -> String {
     let mut cmd = match (opts.kind, opts.target) {
         ("uprobe", Some(path)) => format!("attach uprobe {} {}", path.display(), opts.symbol),
         ("syscall", _) => format!("attach syscall {}", opts.symbol),
@@ -50,19 +57,62 @@ pub fn attach(opts: &Attach<'_>) -> Result<(), String> {
         cmd.push_str("\targs=");
         cmd.push_str(args);
     }
-    first_ok(&exchange(&cmd)?)
+    cmd
+}
+
+pub fn attach_via<F>(send: &mut F, opts: &Attach<'_>) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    first_ok(&send(&attach_command(opts))?)
 }
 
 pub fn detach() -> Result<(), String> {
-    first_ok(&exchange("detach")?)
+    detach_via(&mut |cmd| exchange(cmd))
+}
+
+pub fn detach_via<F>(send: &mut F) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    first_ok(&send("detach")?)
 }
 
 pub fn poll() -> Result<Stats, String> {
-    let reply = exchange("poll")?;
+    poll_via(&mut |cmd| exchange(cmd))
+}
+
+pub fn poll_via<F>(send: &mut F) -> Result<Stats, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    let reply = send("poll")?;
     if reply.starts_with("ERR") {
         return Err(reply.lines().next().unwrap_or("").trim_start_matches("ERR\t").to_string());
     }
     Ok(parse_reply(&reply))
+}
+
+/// 远端 uprobe 符号表：helper 的 `elf <path>` 回复。
+pub fn elf_via<F>(send: &mut F, path: &str) -> Result<probe::ElfSymbols, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    let reply = send(&format!("elf {path}"))?;
+    if reply.starts_with("ERR") {
+        return Err(reply.lines().next().unwrap_or("").trim_start_matches("ERR\t").to_string());
+    }
+    probe::parse_elf_reply(&reply)
+}
+
+/// 本地 helper 是否就绪（ping）。
+pub fn ping() -> Result<(), String> {
+    first_ok(&exchange("ping")?)
+}
+
+/// 本地 UnixSocket 传输，供 via 接口复用。
+pub fn local_transport(cmd: &str) -> Result<String, String> {
+    exchange(cmd)
 }
 
 fn first_ok(reply: &str) -> Result<(), String> {
@@ -156,6 +206,45 @@ mod tests {
         let s = parse_reply("STAT\t0\nEND\n");
         assert_eq!(s.total, 0);
         assert!(s.calls.is_empty());
+    }
+
+    #[test]
+    fn via_transport_commands() {
+        let seen = std::cell::RefCell::new(String::new());
+        let mut send = |cmd: &str| {
+            *seen.borrow_mut() = cmd.to_string();
+            if cmd.starts_with("attach") {
+                Ok("OK\tattached\n".to_string())
+            } else if cmd == "poll" {
+                Ok("STAT\t2\nEND\n".to_string())
+            } else {
+                Ok("OK\tstopped\n".to_string())
+            }
+        };
+        let opts = Attach {
+            kind: "kprobe",
+            target: None,
+            symbol: "vfs_read",
+            stack: true,
+            pid: Some(42),
+            args: "arg0=%x0",
+        };
+        attach_via(&mut send, &opts).unwrap();
+        assert!(seen.borrow().contains("attach kprobe vfs_read"));
+        assert!(seen.borrow().contains("pid=42"));
+        assert_eq!(poll_via(&mut send).unwrap().total, 2);
+        detach_via(&mut send).unwrap();
+    }
+
+    #[test]
+    fn elf_via_parses_helper_reply() {
+        let mut send = |cmd: &str| {
+            assert!(cmd.starts_with("elf /usr/bin/ls"));
+            Ok("ELF\tdynsym\t1\t1\nSYM\tmain\t0x10\t4\t0x10\t1\nEND\n".to_string())
+        };
+        let elf = elf_via(&mut send, "/usr/bin/ls").unwrap();
+        assert_eq!(elf.symbols.len(), 1);
+        assert_eq!(elf.symbols[0].off, Some(0x10));
     }
 
     #[test]

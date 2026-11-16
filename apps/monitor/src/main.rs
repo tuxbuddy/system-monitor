@@ -49,11 +49,13 @@ fn print_help() {
          \n\
          图形版需要桌面会话（Wayland/X11）；本编译{}图形界面。\n\
          MCP 工具：hosts_list / host_use / system_overview / system_load /\n\
-         process_list / process_signal / process_nice / process_details /\n\
-         scheduler_groups / scheduler_set_limit / scheduler_group_action /\n\
-         scheduler_status / host_capabilities / psi_status /\n\
-         network_connections / filesystems / probe_status / probe_search /\n\
-         probe_attach / probe_poll / probe_detach / policy_status",
+         process_list / process_details / process_signal / process_nice /\n\
+         scheduler_groups / scheduler_status / scheduler_set_limit /\n\
+         scheduler_group_action / host_capabilities / psi_status /\n\
+         network_connections / filesystems / probe_* / ebpf_doctor / policy_status /\n\
+         diag_start / diag_add_evidence / diag_submit_plan / diag_approve /\n\
+         diag_execute / diag_verify / diag_status / diag_abort\n\
+         另提供 prompts（诊断工作流）；运行 mcp 后可用 tools/list 查看实时清单",
         env!("CARGO_PKG_VERSION"),
         if cfg!(feature = "gui") { "包含" } else { "未包含" }
     );

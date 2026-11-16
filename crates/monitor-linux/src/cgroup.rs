@@ -55,6 +55,8 @@ pub struct GroupState {
     pub procs: usize,
     /// cpu.stat 节流统计 (nr_periods, nr_throttled, throttled_usec)；文件缺失 None。
     pub throttle: Option<(u64, u64, u64)>,
+    /// cpu.stat 累计 CPU 时间（微秒），用于计算分组实时占用。
+    pub usage_usec: u64,
 }
 
 pub struct CgroupManager {
@@ -313,11 +315,19 @@ fn list_groups_at(container: &Path) -> Result<Vec<GroupState>, CgError> {
         let procs = std::fs::read_to_string(path.join("cgroup.procs"))
             .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
-        let throttle = std::fs::read_to_string(path.join("cpu.stat")).ok().map(|t| {
-            let c = parse_cpu_stat(&t);
+        let cpu_stat = std::fs::read_to_string(path.join("cpu.stat")).ok();
+        let throttle = cpu_stat.as_deref().map(|t| {
+            let c = parse_cpu_stat(t);
             (c.nr_periods, c.nr_throttled, c.throttled_usec)
         });
-        out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs, throttle });
+        let usage_usec = cpu_stat
+            .as_deref()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs, throttle, usage_usec });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
@@ -563,7 +573,7 @@ mod tests {
         std::fs::write(c.join("build/cpu.weight"), "200").unwrap();
         std::fs::write(c.join("build/pids.max"), "max").unwrap();
         std::fs::write(c.join("build/cgroup.procs"), "11\n22\n").unwrap();
-        std::fs::write(c.join("build/cpu.stat"), "nr_periods 10\nnr_throttled 2\nthrottled_usec 5000\n").unwrap();
+        std::fs::write(c.join("build/cpu.stat"), "nr_periods 10\nnr_throttled 2\nthrottled_usec 5000\nusage_usec 123456\n").unwrap();
 
         let groups = list_groups_readonly_at(&root).unwrap();
         assert_eq!(groups.len(), 1);
@@ -573,6 +583,7 @@ mod tests {
         assert_eq!(groups[0].pids_max, None);
         assert_eq!(groups[0].procs, 2);
         assert_eq!(groups[0].throttle, Some((10, 2, 5000)));
+        assert_eq!(groups[0].usage_usec, 123456);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

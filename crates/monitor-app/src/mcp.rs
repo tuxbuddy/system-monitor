@@ -5,7 +5,7 @@
 //! 网络连接、文件系统、探针（本机 tracefs/uprobe）。
 //! 远端主机经 SSH 采集与操作，与 GUI/TUI 使用同一套数据层。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
@@ -31,11 +31,43 @@ struct View {
     last_error: Option<String>,
 }
 
+/// 本地「附加」采样：只有概览、文件系统、网络工具需要。
+#[derive(Clone)]
+struct LocalAux {
+    filesystems: Vec<FsUsage>,
+    conns: Vec<NetConn>,
+}
+
+#[derive(Clone)]
+struct Cached<T> {
+    value: T,
+    at: Instant,
+}
+
+impl<T> Cached<T> {
+    fn fresh(&self, ttl: Duration) -> bool {
+        self.at.elapsed() < ttl
+    }
+}
+
+/// 每主机新鲜度元数据：失败时保留上次成功时间，才能真正给出 stale 数据。
+#[derive(Default)]
+struct RemoteFresh {
+    last_ok: Option<Instant>,
+    last_error: Option<String>,
+}
+
+/// 缓存窗口：连续工具调用（AI 常见行为）不再重复扫 /proc、跑 vcgencmd。
+const LOCAL_USAGE_TTL: Duration = Duration::from_secs(2);
+const LOCAL_PI_TTL: Duration = Duration::from_secs(5);
+const LOCAL_AUX_TTL: Duration = Duration::from_secs(3);
+const REMOTE_TTL: Duration = Duration::from_secs(2);
+
 pub struct Server {
     current: Option<remote::SshTarget>,
     hosts: Vec<remote::SshTarget>,
     /// 每主机最近一次成功采样时刻与失败原因（新鲜度元数据）。
-    remote_fresh: HashMap<String, (Option<Instant>, Option<String>)>,
+    remote_fresh: HashMap<String, RemoteFresh>,
     /// 服务端强制策略：默认 readonly，禁止隐式升级。
     policy: PolicyMode,
     caller: String,
@@ -44,9 +76,14 @@ pub struct Server {
     /// 诊断会话仓库（#25）。
     diag_store: std::sync::Arc<std::sync::Mutex<crate::diagnose::SessionStore>>,
     sampler: Sampler,
-    last_local: Instant,
+    local_usage: Option<Cached<Usage>>,
+    local_pi: Option<Cached<PiStats>>,
+    local_aux: Option<Cached<LocalAux>>,
+    remote_cache: HashMap<String, Cached<remote::RemoteSample>>,
     remote_prev: HashMap<String, Option<remote::Counters>>,
-    probe: Option<(monitor_linux::probe::Snapshot, Instant)>,
+    probe_cache: HashMap<String, (monitor_linux::probe::Snapshot, Instant)>,
+    /// 当前活动探针所在主机：None=无，Some(None)=本机，Some(Some(host))=远端。
+    probe_active: Option<Option<remote::SshTarget>>,
 }
 
 impl Server {
@@ -57,16 +94,23 @@ impl Server {
             policy: PolicyMode::Readonly,
             caller: std::env::var("SM_MCP_CALLER").unwrap_or_else(|_| "stdio".to_string()),
             dispatcher: CommandDispatcher::new(PolicyMode::Readonly, "mcp"),
-            diag_store: std::sync::Arc::new(std::sync::Mutex::new(crate::diagnose::SessionStore::default())),
+            diag_store: std::sync::Arc::new(std::sync::Mutex::new(crate::diagnose::SessionStore::load_or_default())),
             remote_fresh: HashMap::new(),
             sampler: Sampler::new(),
-            last_local: Instant::now() - Duration::from_secs(10),
+            local_usage: None,
+            local_pi: None,
+            local_aux: None,
+            remote_cache: HashMap::new(),
             remote_prev: HashMap::new(),
-            probe: None,
+            probe_cache: HashMap::new(),
+            probe_active: None,
         };
-        // 预热采样，让首次调用就能算出 CPU 百分比
+        // 预热：两次 150ms 间隔的采样，让首个工具调用就返回真实 CPU 百分比
         let _ = s.sampler.sample();
-        s.last_local = Instant::now() - Duration::from_secs(10);
+        std::thread::sleep(Duration::from_millis(150));
+        let usage = s.sampler.sample();
+        s.local_usage = Some(Cached { value: usage, at: Instant::now() });
+        s.local_pi = Some(Cached { value: monitor_linux::pi::read_pi_stats(), at: Instant::now() });
         s
     }
 
@@ -81,72 +125,151 @@ impl Server {
         }
     }
 
-    fn view(&mut self, host: &Option<remote::SshTarget>) -> Result<View, String> {
+    /// 本地 CPU/进程采样：2 秒窗口内复用，长时间无调用时补一次短间隔采样。
+    fn local_usage(&mut self) -> Usage {
+        if let Some(c) = &self.local_usage
+            && c.fresh(LOCAL_USAGE_TTL)
+        {
+            return c.value.clone();
+        }
+        let gap = self.local_usage.as_ref().map(|c| c.at.elapsed()).unwrap_or(Duration::MAX);
+        let mut usage = self.sampler.sample();
+        if gap > Duration::from_secs(3) {
+            // 间隔太久时补一次短间隔采样，返回「瞬时」而不是长时间平均
+            std::thread::sleep(Duration::from_millis(150));
+            usage = self.sampler.sample();
+        }
+        self.local_usage = Some(Cached { value: usage.clone(), at: Instant::now() });
+        usage
+    }
+
+    /// 本地传感器采样：vcgencmd 是子进程，单独 5 秒缓存，只有概览需要。
+    fn local_pi(&mut self) -> PiStats {
+        if let Some(c) = &self.local_pi
+            && c.fresh(LOCAL_PI_TTL)
+        {
+            return c.value.clone();
+        }
+        let value = monitor_linux::pi::read_pi_stats();
+        self.local_pi = Some(Cached { value: value.clone(), at: Instant::now() });
+        value
+    }
+
+    /// 本地附加采样：文件系统与连接表，3 秒窗口内复用。
+    fn local_aux(&mut self) -> LocalAux {
+        if let Some(c) = &self.local_aux
+            && c.fresh(LOCAL_AUX_TTL)
+        {
+            return c.value.clone();
+        }
+        let value = LocalAux {
+            filesystems: procstats::read_filesystems(),
+            conns: procstats::read_net_conns(),
+        };
+        self.local_aux = Some(Cached { value: value.clone(), at: Instant::now() });
+        value
+    }
+
+    /// 采集视图。`aux` 控制是否读文件系统/连接表，`pi` 控制是否跑 vcgencmd；
+    /// 进程、负载、网络、磁盘类工具不为此付无谓成本。
+    fn view(&mut self, host: &Option<remote::SshTarget>, aux: bool, pi: bool) -> Result<View, String> {
         match host {
             None => {
-                let mut usage = self.sampler.sample();
-                if self.last_local.elapsed() > Duration::from_secs(3) {
-                    // 间隔太久时补一次短间隔采样，返回「瞬时」而不是长时间平均
-                    std::thread::sleep(Duration::from_millis(150));
-                    usage = self.sampler.sample();
-                }
-                self.last_local = Instant::now();
+                let usage = self.local_usage();
+                let pi = if pi { self.local_pi() } else { PiStats::default() };
+                let (filesystems, conns) = if aux {
+                    let a = self.local_aux();
+                    (a.filesystems, a.conns)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 Ok(View {
                     usage,
-                    pi: monitor_linux::pi::read_pi_stats(),
-                    filesystems: procstats::read_filesystems(),
-                    conns: procstats::read_net_conns(),
+                    pi,
+                    filesystems,
+                    conns,
                     label: "本地".to_string(),
                     age_secs: 0,
                     stale: false,
                     last_error: None,
                 })
             }
-            Some(h) => {
-                let key = h.as_str().to_string();
-                let mut prev = self.remote_prev.remove(&key).flatten();
-                let first = prev.is_none();
-                let mut sample = remote::collect_result(h, &mut prev);
-                if first && sample.is_err() {
-                    std::thread::sleep(Duration::from_millis(120));
-                    sample = remote::collect_result(h, &mut prev);
+            Some(h) => self.remote_view(h),
+        }
+    }
+
+    fn remote_view(&mut self, h: &remote::SshTarget) -> Result<View, String> {
+        let key = h.as_str().to_string();
+        if let Some(c) = self.remote_cache.get(&key)
+            && c.fresh(REMOTE_TTL)
+        {
+            let age = c.at.elapsed().as_secs();
+            let last_error = self.remote_fresh.get(&key).and_then(|f| f.last_error.clone());
+            return Ok(view_from_sample(c.value.clone(), key, age, last_error.is_some(), last_error));
+        }
+        let mut prev = self.remote_prev.remove(&key).flatten();
+        let first = prev.is_none();
+        let mut sample = remote::collect_result(h, &mut prev);
+        if first && sample.is_err() {
+            std::thread::sleep(Duration::from_millis(120));
+            sample = remote::collect_result(h, &mut prev);
+        }
+        self.remote_prev.insert(key.clone(), prev);
+        match sample {
+            Ok(s) => {
+                let at = Instant::now();
+                self.remote_cache.insert(key.clone(), Cached { value: s.clone(), at });
+                let fresh = self.remote_fresh.entry(key.clone()).or_default();
+                fresh.last_ok = Some(at);
+                fresh.last_error = None;
+                Ok(view_from_sample(s, key, 0, false, None))
+            }
+            Err(e) => {
+                let fresh = self.remote_fresh.entry(key.clone()).or_default();
+                fresh.last_error = Some(e.clone());
+                // 有历史成功样本：降级返回 stale 数据而不是整体报错，调用方仍可继续分析
+                if let Some(c) = self.remote_cache.get(&key) {
+                    let age = fresh
+                        .last_ok
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or_else(|| c.at.elapsed().as_secs());
+                    return Ok(view_from_sample(c.value.clone(), key, age, true, Some(e)));
                 }
-                self.remote_prev.insert(key.clone(), prev);
-                match sample {
-                    Ok(s) => {
-                        self.remote_fresh.insert(key.clone(), (Some(Instant::now()), None));
-                        Ok(View {
-                            usage: s.usage,
-                            pi: s.pi,
-                            filesystems: s.filesystems,
-                            conns: s.conns,
-                            label: h.as_str().to_string(),
-                            age_secs: 0,
-                            stale: false,
-                            last_error: None,
-                        })
-                    }
-                    Err(e) => {
-                        // 失败：记录错误；若此前有成功样本，带 stale 标记返回旧数据
-                        self.remote_fresh.insert(key.clone(), (None, Some(e.clone())));
-                        let (last_at, _) = self.remote_fresh.get(&key).cloned().unwrap_or((None, None));
-                        let age = last_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                        // 无历史数据时向上报错;有历史时调用方可继续用 overview_json 的 stale 标记
-                        Err(format!(
-                            "{{\"error\":\"collect_failed\",\"host\":\"{key}\",\"message\":\"{e}\",\"stale\":true,\"last_ok_age_secs\":{age}}}"
-                        ))
-                    }
-                }
+                Err(json!({
+                    "error": "collect_failed",
+                    "host": key,
+                    "message": e,
+                    "stale": false,
+                })
+                .to_string())
             }
         }
     }
 
-    fn probe_snapshot(&mut self) -> &monitor_linux::probe::Snapshot {
-        let stale = self.probe.as_ref().is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(60));
-        if stale {
-            self.probe = Some((monitor_linux::probe::Snapshot::load(), Instant::now()));
+    fn probe_snapshot(&mut self, host: &Option<remote::SshTarget>) -> Result<monitor_linux::probe::Snapshot, String> {
+        let key = host
+            .as_ref()
+            .map(|t| t.as_str().to_string())
+            .unwrap_or_else(|| "local".to_string());
+        if let Some((snap, at)) = self.probe_cache.get(&key)
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return Ok(snap.clone());
         }
-        &self.probe.as_ref().expect("刚刚写入").0
+        let snap = crate::probe_source::snapshot(host.as_ref())?;
+        self.probe_cache.insert(key, (snap.clone(), Instant::now()));
+        Ok(snap)
+    }
+
+    /// poll/detach 的 host 解析：显式 host 优先，否则用活动探针 host；都没有则本机。
+    fn probe_host_arg(&self, args: &Value) -> Result<Option<remote::SshTarget>, String> {
+        match args.get("host").and_then(|v| v.as_str()) {
+            Some(h) if !h.is_empty() && h != "local" => {
+                remote::SshTarget::parse(h).map(Some).map_err(|e| format!("host 参数非法：{e}"))
+            }
+            Some(_) => Ok(None),
+            None => Ok(self.probe_active.clone().unwrap_or(None)),
+        }
     }
 
     fn audit(&self, tool: &str, level: RiskLevel, ok: bool, error: Option<&str>) {
@@ -204,18 +327,25 @@ impl Server {
 
     fn call_inner(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
-            "policy_status" => Ok(json!({
-                "mode": self.policy.as_str(),
-                "caller": self.caller,
-                "levels": {
-                    "L0_read": ["hosts_list", "system_overview", "system_load", "process_list", "network_connections", "filesystems"],
-                    "L1_diagnose": ["host_use", "probe_status", "probe_search", "probe_poll"],
-                    "L2_recoverable": ["process_nice", "process_signal(非KILL且非tree)", "scheduler_set_limit", "scheduler_group_action(create)", "probe_attach", "probe_detach"],
-                    "L3_destructive": ["process_signal(KILL或tree)", "scheduler_group_action(delete)"],
-                },
-                "approval": "L3 在 confirm 模式下需 approval_token（由 system-monitor mcp-approve 签发，一次性、绑定参数）",
-                "audit": "~/.local/share/system-monitor/mcp-audit.jsonl",
-            })),
+            "policy_status" => {
+                let mut levels: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                for (name, level) in mcppolicy::catalog() {
+                    levels.entry(level.as_str()).or_default().push(name);
+                }
+                Ok(json!({
+                    "mode": self.policy.as_str(),
+                    "caller": self.caller,
+                    "current_host": self.current.as_ref().map(|t| t.as_str()).unwrap_or("local"),
+                    "levels": levels,
+                    "parameter_sensitive": {
+                        "process_signal": "signal=KILL 或 tree=true → L3",
+                        "scheduler_group_action": "action=delete → L3",
+                        "diag_execute": "实际风险由 plan 内命令决定，执行时经 dispatcher 复核",
+                    },
+                    "approval": "confirm 模式下 L3 需 approval_token（system-monitor mcp-approve 签发，一次性、绑定参数）",
+                    "audit": "~/.local/share/system-monitor/mcp-audit.jsonl",
+                }))
+            }
             "hosts_list" => {
                 let (saved, errs) = remote::load_hosts();
                 Ok(json!({
@@ -232,7 +362,13 @@ impl Server {
                 }
                 let target = remote::SshTarget::parse(&h).map_err(|e| format!("host 参数非法：{e}"))?;
                 let mut prev = None;
-                let sample = remote::collect(&target, &mut prev).ok_or_else(|| format!("无法连接主机：{h}"))?;
+                let sample = remote::collect_result(&target, &mut prev).map_err(|e| format!("无法连接主机：{h}（{e}）"))?;
+                let at = Instant::now();
+                self.remote_cache.insert(h.clone(), Cached { value: sample.clone(), at });
+                self.remote_prev.insert(h.clone(), prev);
+                let fresh = self.remote_fresh.entry(h.clone()).or_default();
+                fresh.last_ok = Some(at);
+                fresh.last_error = None;
                 self.current = Some(target.clone());
                 if !self.hosts.iter().any(|x| x == &target) {
                     self.hosts.push(target.clone());
@@ -245,12 +381,12 @@ impl Server {
             }
             "system_overview" => {
                 let host = self.target(args)?;
-                let v = self.view(&host)?;
+                let v = self.view(&host, true, true)?;
                 Ok(overview_json(&v))
             }
             "system_load" => {
                 let host = self.target(args)?;
-                let v = self.view(&host)?;
+                let v = self.view(&host, false, false)?;
                 Ok(json!({
                     "host": v.label,
                     "load": v.usage.load.map(|l| json!({"1m": round2(l.one), "5m": round2(l.five), "15m": round2(l.fifteen)})),
@@ -262,7 +398,7 @@ impl Server {
             }
             "process_list" => {
                 let host = self.target(args)?;
-                let v = self.view(&host)?;
+                let v = self.view(&host, false, false)?;
                 let sort = args.get("sort").and_then(|x| x.as_str()).unwrap_or("cpu");
                 let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(25).clamp(1, 500) as usize;
                 let filter = args.get("filter").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
@@ -295,7 +431,7 @@ impl Server {
                         })
                     })
                     .collect();
-                Ok(json!({"host": v.label, "total": total, "sort": sort, "processes": rows}))
+                Ok(json!({"host": v.label, "total": total, "sort": sort, "processes": rows, "freshness": freshness_json(&v)}))
             }
             "process_signal" => {
                 let pid = args.get("pid").and_then(|v| v.as_i64()).ok_or("缺少 pid")? as i32;
@@ -322,7 +458,7 @@ impl Server {
                     }
                     Some(h) => {
                         if tree {
-                            let v = self.view(&host)?;
+                            let v = self.view(&host, false, false)?;
                             let pairs: Vec<(i32, i32)> = v.usage.procs.iter().map(|p| (p.pid, p.ppid)).collect();
                             let mut pids = procstats::descendants(pid, &pairs);
                             pids.push(pid);
@@ -404,8 +540,15 @@ impl Server {
             // ---- 诊断会话（#25）----
             "diag_start" => {
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.create();
-                Ok(json!({"session": sess.id, "phase": sess.phase.as_str()}))
+                let (id, phase, next) = {
+                    let sess = store.create();
+                    (sess.id.clone(), sess.phase.as_str(), sess.next_action())
+                };
+                let path = store.persist(&id);
+                Ok(json!({
+                    "session": id, "phase": phase, "next_action": next,
+                    "persisted": path.is_some(),
+                }))
             }
             "diag_add_evidence" => {
                 let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
@@ -418,9 +561,16 @@ impl Server {
                     _ => crate::diagnose::Confidence::High,
                 };
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
-                let ev = sess.add_evidence(source, fact, hypothesis, conf);
-                Ok(json!({"session": id, "evidence_id": ev.id, "phase": sess.phase.as_str()}))
+                let (evidence_id, phase, next) = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    let ev = sess.add_evidence(source, fact, hypothesis, conf);
+                    (ev.id, sess.phase.as_str(), sess.next_action())
+                };
+                let _ = store.persist(id);
+                Ok(json!({
+                    "session": id, "evidence_id": evidence_id,
+                    "phase": phase, "next_action": next,
+                }))
             }
             "diag_submit_plan" => {
                 let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
@@ -430,9 +580,23 @@ impl Server {
                 let verify = args.get("verify_metric").and_then(|v| v.as_str()).unwrap_or("");
                 let risk = derive_risk(&command)?;
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
-                let h = sess.submit_plan(description, command, risk, rollback, verify);
-                Ok(json!({"session": id, "plan_hash": format!("{h:016x}"), "risk": risk.as_str(), "phase": sess.phase.as_str()}))
+                let (h, phase, next) = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    let h = sess.submit_plan(description, command, risk, rollback, verify)?;
+                    (h, sess.phase.as_str(), sess.next_action())
+                };
+                let _ = store.persist(id);
+                let mut warnings: Vec<&str> = Vec::new();
+                if rollback.trim().is_empty() || rollback.trim() == "无" {
+                    warnings.push("未提供回滚步骤：可恢复动作也应能还原");
+                }
+                if verify.trim().is_empty() {
+                    warnings.push("未提供验证指标：执行后无法判断是否生效");
+                }
+                Ok(json!({
+                    "session": id, "plan_hash": format!("{h:016x}"), "risk": risk.as_str(),
+                    "phase": phase, "next_action": next, "warnings": warnings,
+                }))
             }
             "diag_approve" => {
                 let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
@@ -440,53 +604,74 @@ impl Server {
                 let h = u64::from_str_radix(hash_raw, 16).map_err(|_| "plan_hash 需为 16 进制")?;
                 let token = args.get("approval_token").and_then(|v| v.as_str()).map(String::from);
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
-                let token_result = sess
-                    .plans
-                    .get(&h)
-                    .map(|plan| {
-                        if plan.risk >= monitor_core::mcppolicy::RiskLevel::L3 {
-                            match &token {
-                                Some(t) => monitor_core::mcppolicy::consume_approval(
-                                    "diag_execute",
-                                    &json!({"session": id, "plan": plan.command_json}),
-                                    t,
-                                )
-                                .map(|_| ()),
-                                None => Err("L3 需要 approval_token(mcp-approve --tool diag_execute)".to_string()),
+                let (phase, next) = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    let token_result = sess
+                        .plans
+                        .get(&h)
+                        .map(|plan| {
+                            if plan.risk >= monitor_core::mcppolicy::RiskLevel::L3 {
+                                match &token {
+                                    Some(t) => monitor_core::mcppolicy::consume_approval(
+                                        "diag_execute",
+                                        &json!({"session": id, "plan": plan.command_json}),
+                                        t,
+                                    )
+                                    .map(|_| ()),
+                                    None => Err("L3 需要 approval_token(mcp-approve --tool diag_execute)".to_string()),
+                                }
+                            } else {
+                                Ok(())
                             }
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .unwrap_or_else(|| Err("计划不存在".to_string()));
-                sess.approve(h, true, token_result).map_err(|e| e.to_string())?;
-                Ok(json!({"session": id, "plan_hash": hash_raw, "approved": true, "phase": sess.phase.as_str()}))
+                        })
+                        .unwrap_or_else(|| Err("计划不存在".to_string()));
+                    sess.approve(h, true, token_result).map_err(|e| e.to_string())?;
+                    (sess.phase.as_str(), sess.next_action())
+                };
+                let _ = store.persist(id);
+                Ok(json!({
+                    "session": id, "plan_hash": hash_raw, "approved": true,
+                    "phase": phase, "next_action": next,
+                }))
             }
             "diag_execute" => {
                 let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
                 let hash_raw = args.get("plan_hash").and_then(|v| v.as_str()).ok_or("缺少 plan_hash")?;
                 let h = u64::from_str_radix(hash_raw, 16).map_err(|_| "plan_hash 需为 16 进制")?;
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
-                sess.can_execute(h).map_err(|e| e.to_string())?;
-                let cmd = sess.plans.get(&h).ok_or("计划不存在")?.command_json.clone();
-                let command = command_from_json(&cmd)?;
-                let result = self.dispatcher.run(&command);
-                let (ok, msg) = match result {
-                    Ok(m) => (true, m),
-                    Err(e) => (false, e.to_string()),
+                let (ok, msg, phase) = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    sess.can_execute(h).map_err(|e| e.to_string())?;
+                    let cmd = sess.plans.get(&h).ok_or("计划不存在")?.command_json.clone();
+                    let command = command_from_json(&cmd)?;
+                    let (ok, msg) = match self.dispatcher.run(&command) {
+                        Ok(m) => (true, m),
+                        Err(e) => (false, e.to_string()),
+                    };
+                    sess.record_execution(h, ok, &msg).map_err(|e| e.to_string())?;
+                    (ok, msg, sess.phase)
                 };
-                sess.record_execution(h, ok, &msg).map_err(|e| e.to_string())?;
-                Ok(json!({"session": id, "ok": ok, "message": msg, "phase": sess.phase.as_str()}))
+                let _ = store.persist(id);
+                Ok(json!({
+                    "session": id, "ok": ok, "message": msg,
+                    "phase": phase.as_str(), "next_action": phase.next_action(),
+                }))
             }
             "diag_verify" => {
                 let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
                 let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
-                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
-                sess.verify(&note);
-                Ok(json!({"session": id, "phase": sess.phase.as_str(), "report": sess.to_json()}))
+                let phase = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    sess.verify(&note);
+                    sess.phase
+                };
+                let path = store.persist(id);
+                let report = store.get(id).map(|s| s.to_json()).unwrap_or(Value::Null);
+                Ok(json!({
+                    "session": id, "phase": phase.as_str(), "next_action": phase.next_action(),
+                    "report": report, "report_path": path.map(|p| p.display().to_string()),
+                }))
             }
             "diag_status" => {
                 let store = self.diag_store.lock().map_err(|e| e.to_string())?;
@@ -495,8 +680,26 @@ impl Server {
                         let sess = store.get(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
                         Ok(sess.to_json())
                     }
-                    None => Ok(json!({"sessions": store.ids()})),
+                    None => {
+                        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).clamp(1, 64) as usize;
+                        Ok(json!({
+                            "sessions": store.summaries(limit),
+                            "next_action": "diag_status",
+                            "hint": "传入 session 查看完整报告；按 next_action 继续未完成会话",
+                        }))
+                    }
                 }
+            }
+            "diag_abort" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let phase = {
+                    let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                    sess.abort()?;
+                    sess.phase
+                };
+                let _ = store.persist(id);
+                Ok(json!({"session": id, "phase": phase.as_str(), "next_action": "none"}))
             }
             "psi_status" => {
                 let snap = monitor_core::psi::read_local();
@@ -634,7 +837,7 @@ impl Server {
             }
             "network_connections" => {
                 let host = self.target(args)?;
-                let v = self.view(&host)?;
+                let v = self.view(&host, true, false)?;
                 let proto = args.get("proto").and_then(|x| x.as_str()).map(|s| s.to_uppercase());
                 let state = args.get("state").and_then(|x| x.as_str()).map(|s| s.to_uppercase());
                 let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(50).clamp(1, 1000) as usize;
@@ -653,23 +856,29 @@ impl Server {
                     "connections": rows.iter().map(|c| json!({
                         "proto": c.proto, "local": c.local, "remote": c.remote, "state": c.state, "uid": c.uid,
                     })).collect::<Vec<_>>(),
+                    "freshness": freshness_json(&v),
                 }))
             }
             "filesystems" => {
                 let host = self.target(args)?;
-                let v = self.view(&host)?;
+                let v = self.view(&host, true, false)?;
                 Ok(json!({
                     "host": v.label,
                     "filesystems": v.filesystems.iter().map(|f| json!({
                         "source": f.source, "mount": f.mount, "total_kb": f.total_kb, "avail_kb": f.avail_kb,
                         "used_kb": f.used_kb(), "used_percent": round1(f.used_frac() * 100.0),
                     })).collect::<Vec<_>>(),
+                    "freshness": freshness_json(&v),
                 }))
             }
             "probe_status" => {
-                let snap = self.probe_snapshot();
+                let host = self.target(args)?;
+                let snap = self.probe_snapshot(&host)?;
+                let scope = if host.is_some() { "远端" } else { "本机" };
                 Ok(json!({
-                    "scope": "本机",
+                    "scope": scope,
+                    "host": host.as_ref().map(|h| h.as_str()).unwrap_or("local"),
+                    "helper_ready": snap.helper_ready,
                     "kernel_release": snap.kernel_release,
                     "functions": snap.functions.len(),
                     "syscalls": snap.syscalls.len(),
@@ -696,10 +905,11 @@ impl Server {
                 }))
             }
             "probe_search" => {
+                let host = self.target(args)?;
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
                 let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("both");
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).clamp(1, 500) as usize;
-                let snap = self.probe_snapshot();
+                let snap = self.probe_snapshot(&host)?;
                 let mut out: Vec<Value> = Vec::new();
                 if kind != "syscall" {
                     for s in snap.functions.iter().filter(|s| s.name.to_lowercase().contains(&q)) {
@@ -717,9 +927,13 @@ impl Server {
                         }
                     }
                 }
-                Ok(json!({"query": q, "count": out.len(), "results": out}))
+                Ok(json!({
+                    "host": host.as_ref().map(|h| h.as_str()).unwrap_or("local"),
+                    "query": q, "count": out.len(), "results": out,
+                }))
             }
             "probe_attach" => {
+                let host = self.target(args)?;
                 let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("kprobe");
                 let symbol = args.get("symbol").and_then(|v| v.as_str()).ok_or("缺少 symbol")?;
                 let target = args.get("target").and_then(|v| v.as_str()).map(std::path::PathBuf::from);
@@ -734,12 +948,27 @@ impl Server {
                     pid,
                     args: extra,
                 };
-                monitor_linux::probeclient::attach(&attach)?;
-                Ok(json!({"attached": true, "kind": kind, "symbol": symbol, "stack": stack, "pid": pid}))
+                if let Some(prev) = self.probe_active.clone()
+                    && prev != host
+                {
+                    let mut prev_send = |cmd: &str| crate::probe_source::exchange(prev.as_ref(), cmd);
+                    let _ = monitor_linux::probeclient::detach_via(&mut prev_send);
+                }
+                self.probe_active = None;
+                let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+                monitor_linux::probeclient::attach_via(&mut send, &attach)?;
+                self.probe_active = Some(host.clone());
+                Ok(json!({
+                    "attached": true, "kind": kind, "symbol": symbol, "stack": stack, "pid": pid,
+                    "host": host.as_ref().map(|h| h.as_str()).unwrap_or("local"),
+                }))
             }
             "probe_poll" => {
-                let stats = monitor_linux::probeclient::poll()?;
+                let host = self.probe_host_arg(args)?;
+                let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+                let stats = monitor_linux::probeclient::poll_via(&mut send)?;
                 Ok(json!({
+                    "host": host.as_ref().map(|h| h.as_str()).unwrap_or("local"),
                     "total": stats.total,
                     "calls": stats.calls.iter().map(|c| json!({
                         "comm": c.comm, "pid": c.pid, "entry": c.entry, "ret": c.ret, "stack": c.stack,
@@ -747,8 +976,14 @@ impl Server {
                 }))
             }
             "probe_detach" => {
-                monitor_linux::probeclient::detach()?;
-                Ok(json!({"detached": true}))
+                let host = self.probe_host_arg(args)?;
+                let mut send = |cmd: &str| crate::probe_source::exchange(host.as_ref(), cmd);
+                monitor_linux::probeclient::detach_via(&mut send)?;
+                self.probe_active = None;
+                Ok(json!({
+                    "detached": true,
+                    "host": host.as_ref().map(|h| h.as_str()).unwrap_or("local"),
+                }))
             }
             other => Err(format!("未知工具：{other}")),
         }
@@ -801,6 +1036,19 @@ fn round1(v: f32) -> f64 {
 
 fn round2(v: f32) -> f64 {
     (f64::from(v) * 100.0).round() / 100.0
+}
+
+fn view_from_sample(s: remote::RemoteSample, label: String, age_secs: u64, stale: bool, last_error: Option<String>) -> View {
+    View {
+        usage: s.usage,
+        pi: s.pi,
+        filesystems: s.filesystems,
+        conns: s.conns,
+        label,
+        age_secs,
+        stale,
+        last_error,
+    }
 }
 
 fn freshness_json(v: &View) -> Value {
@@ -996,7 +1244,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "diag_start",
-            "开始一次诊断会话:后续证据/方案/审批/执行/验证都引用返回的 session id。",
+            "开始一次诊断会话:后续证据/方案/审批/执行/验证都引用返回的 session id。会话持久化到 ~/.local/share/system-monitor/diag，重启后可继续。",
             json!({}),
             &[],
         ),
@@ -1014,7 +1262,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "diag_submit_plan",
-            "提交动作方案:命令 JSON(kind=cg_set|signal|nice,经统一 dispatcher 执行)、回滚步骤、预期验证指标。返回 plan_hash。",
+            "提交动作方案(需先有至少一条证据):命令 JSON(kind=cg_set|signal|nice,经统一 dispatcher 执行)、回滚步骤、预期验证指标。返回 plan_hash 与 warnings。",
             json!({
                 "session": {"type": "string"},
                 "description": {"type": "string"},
@@ -1042,15 +1290,21 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "diag_verify",
-            "复采验证并归档会话(可回放/导出)。",
+            "复采验证并归档会话(返回完整报告与 report_path，可回放/导出)。",
             json!({"session": {"type": "string"}, "note": {"type": "string"}}),
             &["session"],
         ),
         tool(
             "diag_status",
-            "查看会话状态/报告(含证据链与审计要素)。",
-            json!({"session": {"type": "string"}}),
+            "查看会话状态/报告(含证据链与审计要素)，返回 next_action 指示下一步工具；省略 session 时列出最近会话摘要（limit 默认 20，最大 64）。",
+            json!({"session": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 64}}),
             &[],
+        ),
+        tool(
+            "diag_abort",
+            "中止诊断会话（不再推进状态机）；已归档会话不可中止。",
+            json!({"session": {"type": "string"}}),
+            &["session"],
         ),
         tool(
             "psi_status",
@@ -1106,53 +1360,53 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "probe_status",
-            "本机探针能力：内核版本、kallsyms 函数/系统调用数量、可探测用户态目标、tracefs/BPF 权限与所需工具。",
-            json!({}),
+            "探针能力（本机或 host 指定的远端）：内核版本、kallsyms 函数/系统调用数量、可探测用户态目标、tracefs/BPF 权限、helper 就绪状态。",
+            json!({"host": {"type": "string"}}),
             &[],
         ),
         tool(
             "probe_search",
-            "在 kallsyms 中搜索函数或系统调用名。",
+            "在 kallsyms 中搜索函数或系统调用名（支持远端 host）。",
             json!({
                 "query": {"type": "string"},
                 "kind": {"type": "string", "enum": ["function", "syscall", "both"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "host": {"type": "string"},
             }),
             &["query"],
         ),
         tool(
             "probe_attach",
-            "挂载 kprobe / syscall / uprobe（需先安装 root probe-helper 服务）。可指定 stack、pid、args 过滤。",
+            "挂载 kprobe / syscall / uprobe（本机或 host 指定的远端，需目标机已安装 root probe-helper 服务）。可指定 stack、pid、args 过滤。",
             json!({
                 "kind": {"type": "string", "enum": ["kprobe", "syscall", "uprobe"]},
                 "symbol": {"type": "string"},
                 "target": {"type": "string", "description": "uprobe 的可执行文件路径"},
                 "stack": {"type": "boolean"},
                 "pid": {"type": "integer"},
-                "args": {"type": "string", "description": "附加过滤表达式，如 comm==bash"},
+                "args": {"type": "string", "description": "tracefs fetchargs（arm64: arg0=%x0；x86_64: arg0=%di）"},
+                "host": {"type": "string"},
             }),
             &["symbol"],
         ),
-        tool("probe_poll", "读取探针累计命中与最近调用记录。", json!({}), &[]),
-        tool("probe_detach", "卸载当前探针。", json!({}), &[]),
+        tool("probe_poll", "读取探针累计命中与最近调用记录（默认沿用活动探针主机）。", json!({"host": {"type": "string"}}), &[]),
+        tool("probe_detach", "卸载当前探针（默认沿用活动探针主机）。", json!({"host": {"type": "string"}}), &[]),
     ]
 }
 
 /// 工具声明：注解（readOnlyHint/destructiveHint）由服务端分级表派生，
 /// 与 mcppolicy::risk_of 保持同源，不会出现注解放行、服务端拒绝的劈叉。
 fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
-    // 静态注解按工具名的基础分级；参数敏感（KILL/tree/delete）在服务端运行时升级
+    // 注解只是给客户端的提示，服务端策略仍以 mcppolicy 为准。
     const READ_ONLY_TOOLS: &[&str] = &[
-        "hosts_list", "host_use", "system_overview", "system_load", "process_list",
-        "network_connections", "filesystems", "probe_status", "probe_search", "probe_poll",
-        "policy_status",
+        "hosts_list", "system_overview", "system_load", "process_list", "process_details",
+        "host_capabilities", "network_connections", "filesystems", "scheduler_groups",
+        "scheduler_status", "psi_status", "ebpf_doctor", "probe_status", "probe_search",
+        "probe_poll", "policy_status",
     ];
-    let (read_only, destructive) = match name {
-        // 运行时按参数定级（KILL/tree/delete 会升级 L3），注解不给只读提示
-        "process_signal" | "scheduler_group_action" => (false, false),
-        n if READ_ONLY_TOOLS.contains(&n) => (true, false),
-        _ => (false, false),
-    };
+    let read_only = READ_ONLY_TOOLS.contains(&name);
+    // 这两个工具是否破坏性取决于参数（KILL/tree/delete），按保守方向提示
+    let destructive = matches!(name, "process_signal" | "scheduler_group_action");
     json!({
         "name": name,
         "description": desc,
@@ -1164,8 +1418,83 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
         "annotations": {
             "readOnlyHint": read_only,
             "destructiveHint": destructive,
+            "idempotentHint": read_only,
+            "openWorldHint": false,
         },
     })
+}
+
+/// 预置工作流（MCP prompts）：把「该怎么用这些工具」直接交给 AI 客户端。
+fn prompts() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "diagnose_high_cpu",
+            "title": "高 CPU 定位与可回滚处置",
+            "description": "证据 → 方案 → 审批 → 执行 → 验证的闭环，默认不 KILL。",
+            "arguments": [{"name": "host", "description": "目标主机（local 或 user@host）", "required": false}],
+        }),
+        json!({
+            "name": "diagnose_memory_pressure",
+            "title": "内存压力排查",
+            "description": "结合 PSI、进程 RSS 与 OOM 计数判断内存压力来源，避免直接杀进程。",
+            "arguments": [{"name": "host", "description": "目标主机（local 或 user@host）", "required": false}],
+        }),
+        json!({
+            "name": "host_health_check",
+            "title": "主机只读体检",
+            "description": "按固定顺序采集能力、负载、压力、磁盘、网络与调度状态，输出异常与建议。",
+            "arguments": [{"name": "host", "description": "目标主机（local 或 user@host）", "required": false}],
+        }),
+    ]
+}
+
+fn prompt_messages(name: &str, args: &Value) -> Option<Value> {
+    let host = args
+        .get("host")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("当前主机");
+    let (description, text) = match name {
+        "diagnose_high_cpu" => (
+            "高 CPU 定位与可回滚处置",
+            format!(
+                "在 {host} 上做一次高 CPU 诊断，严格按步骤：\n\
+                 1. system_overview 与 system_load 记录总 CPU、每核、负载；psi_status 看 CPU 压力。\n\
+                 2. process_list {{\"sort\":\"cpu\",\"limit\":10}} 找出持续占用最高的进程，确认 PID、命令名、用户；必要时 process_details 看线程与 FD。\n\
+                 3. diag_start 开会话，用 diag_add_evidence 把读数写成证据（事实与推断分开，标注置信度）。\n\
+                 4. 优先可回滚方案：scheduler_set_limit 限流分组或 process_nice；用 diag_submit_plan 提交，写清回滚步骤与验证指标。\n\
+                 5. diag_approve → diag_execute → 复采后 diag_verify 归档。\n\
+                 不要直接 KILL 或结束进程树；L3 必须由人在本机用 system-monitor mcp-approve 签发 approval_token。"
+            ),
+        ),
+        "diagnose_memory_pressure" => (
+            "内存压力排查",
+            format!(
+                "在 {host} 上排查内存压力：\n\
+                 1. system_overview 看内存/Swap 与 OOM 计数；psi_status 看 memory some/full。\n\
+                 2. process_list {{\"sort\":\"mem\",\"limit\":15}} 与 sort=rss 找大户；对重点进程用 process_details 看 RSS、线程与 FD。\n\
+                 3. filesystems 排除磁盘写满造成的假象；host_capabilities 确认 mem cgroup 是否可用，不可用时不要提案内存限额。\n\
+                 4. 把证据写入 diag_start 会话；处置优先 process_nice 或调度分组限流，提交方案时写明回滚与验证指标。\n\
+                 不要直接杀进程；需要时才走 L3 并由人签发审批凭证。"
+            ),
+        ),
+        "host_health_check" => (
+            "主机只读体检",
+            format!(
+                "对 {host} 做一次只读体检，不做任何写操作：\n\
+                 1. host_capabilities 确认采集能力边界。\n\
+                 2. system_overview → system_load → psi_status 看资源与压力。\n\
+                 3. filesystems → network_connections {{\"state\":\"LISTEN\"}} 看磁盘与监听端口。\n\
+                 4. scheduler_status 看 cgroup 委派与可写性；本机再看 probe_status。\n\
+                 汇总异常项、可能原因与下一步建议；需要处置时再走诊断会话。"
+            ),
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "description": description,
+        "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+    }))
 }
 
 fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
@@ -1176,25 +1505,53 @@ fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
     let response = match method {
         "initialize" => Ok(json!({
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "prompts": {}},
             "serverInfo": {"name": "system-monitor", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "系统监视器 MCP：hosts_list / host_use 切换主机；system_overview / system_load 看负载；process_list / process_signal / process_nice 管进程；scheduler_* 管 cgroup；network_connections / filesystems；probe_* 为本机探针。",
+            "instructions": "系统监视器 MCP（本地 / SSH 远端），默认只读。\
+看现状：system_overview → system_load / psi_status → process_list（高占用）→ process_details（单进程细节）。\
+所有工具接受 host=local|user@host，省略时用 host_use 的默认主机；跨主机操作请显式传 host。\
+要改系统状态：diag_start → diag_add_evidence → diag_submit_plan（写 rollback 与 verify_metric）→ diag_approve → diag_execute → diag_verify。\
+readonly 模式拒绝 L2+；confirm 下 L3 需 approval_token；写操作全部审计。\
+probe_* 仅本机且需 root probe-helper。返回同时包含 text 与 structuredContent，错误为结构化 JSON。",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
+        "prompts/list" => Ok(json!({"prompts": prompts()})),
+        "prompts/get" => {
+            let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match prompt_messages(name, &args) {
+                Some(v) => Ok(v),
+                None => Err((-32602, format!("未知 prompt：{name}"))),
+            }
+        }
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             match server.call(name, &args) {
-                Ok(v) => Ok(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())}],
-                    "isError": false,
-                })),
-                Err(e) => Ok(json!({
-                    "content": [{"type": "text", "text": e}],
-                    "isError": true,
-                })),
+                Ok(v) => {
+                    let text = serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string());
+                    Ok(json!({
+                        "content": [{"type": "text", "text": text}],
+                        "structuredContent": v,
+                        "isError": false,
+                    }))
+                }
+                Err(e) => {
+                    // 统一错误 envelope：已是 JSON 的（策略拒绝/采集失败）原样透传，其余包装
+                    let payload = serde_json::from_str::<Value>(&e)
+                        .ok()
+                        .filter(|v| v.is_object())
+                        .unwrap_or_else(|| json!({"error": "tool_error", "tool": name, "message": e}));
+                    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+                    Ok(json!({
+                        "content": [{"type": "text", "text": text}],
+                        "structuredContent": payload,
+                        "isError": true,
+                    }))
+                }
             }
         }
         other => Err((-32601, format!("未知方法：{other}"))),
@@ -1362,8 +1719,77 @@ mod tests {
         let tools = r["result"]["tools"].as_array().unwrap();
         let find = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
         assert_eq!(find("system_overview")["annotations"]["readOnlyHint"], true);
+        assert_eq!(find("system_overview")["annotations"]["idempotentHint"], true);
         assert_eq!(find("process_nice")["annotations"]["readOnlyHint"], false);
+        assert_eq!(find("process_signal")["annotations"]["destructiveHint"], true);
+        assert_eq!(find("scheduler_group_action")["annotations"]["destructiveHint"], true);
+        assert_eq!(find("scheduler_groups")["annotations"]["readOnlyHint"], true);
         assert!(find("policy_status")["name"] == "policy_status");
+    }
+
+    #[test]
+    fn catalog_covers_every_advertised_tool() {
+        let listed = tools();
+        let mut advertised: Vec<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        advertised.sort_unstable();
+        let mut catalog: Vec<&str> = mcppolicy::catalog().iter().map(|(n, _)| *n).collect();
+        catalog.sort_unstable();
+        assert_eq!(advertised, catalog, "policy_status 目录必须覆盖 tools/list，反之亦然");
+    }
+
+    #[test]
+    fn docs_list_every_advertised_tool() {
+        let readme = include_str!("../../../README.md");
+        let skill = include_str!("../../../skills/system-monitor/SKILL.md");
+        for (name, _) in mcppolicy::catalog() {
+            assert!(readme.contains(name), "README.md 缺少工具 {name}");
+            assert!(skill.contains(name), "SKILL.md 缺少工具 {name}");
+        }
+    }
+
+    #[test]
+    fn tools_call_returns_structured_content_and_error_envelope() {
+        let mut s = Server::new();
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"system_load","arguments":{}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], false);
+        assert_eq!(r["result"]["structuredContent"]["host"], "本地");
+        // 参数错误也要有结构化 envelope，而不是裸字符串
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"process_details","arguments":{}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], true);
+        let v = &r["result"]["structuredContent"];
+        assert_eq!(v["error"], "tool_error");
+        assert_eq!(v["tool"], "process_details");
+        assert!(v["message"].as_str().unwrap().contains("pid"));
+    }
+
+    #[test]
+    fn prompts_expose_workflows() {
+        let mut s = Server::new();
+        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":22,"method":"prompts/list"}"#);
+        let list = r["result"]["prompts"].as_array().unwrap();
+        assert!(list.iter().any(|p| p["name"] == "diagnose_high_cpu"));
+        assert!(list.iter().any(|p| p["name"] == "host_health_check"));
+
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":23,"method":"prompts/get","params":{"name":"diagnose_high_cpu","arguments":{"host":"user@box"}}}"#,
+        );
+        let text = r["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("user@box"));
+        assert!(text.contains("diag_start"));
+        assert!(text.contains("不要直接 KILL"));
+
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":24,"method":"prompts/get","params":{"name":"nope"}}"#,
+        );
+        assert_eq!(r["error"]["code"], -32602);
     }
 
     #[test]
@@ -1375,6 +1801,7 @@ mod tests {
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         let v: Value = serde_json::from_str(text).unwrap();
         let sid = v["session"].as_str().unwrap().to_string();
+        assert_eq!(v["next_action"], "diag_add_evidence");
 
         for (fact, hyp) in [("cpu 95%", "ffmpeg 占满"), ("psi.cpu.some avg10=45", "真实争用")] {
             let line = format!(
@@ -1390,6 +1817,8 @@ mod tests {
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         let v: Value = serde_json::from_str(text).unwrap();
         let hash = v["plan_hash"].as_str().unwrap().to_string();
+        assert_eq!(v["next_action"], "diag_approve");
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 0);
 
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"diag_approve","arguments":{{"session":"{sid}","plan_hash":"{hash}"}}}}}}"#
@@ -1405,6 +1834,7 @@ mod tests {
         let v: Value = serde_json::from_str(text).unwrap();
         // cg_set 本机无 cgroup 环境会执行失败,但流程状态机必须推进到 verifying
         assert_eq!(v["phase"], "verifying", "{v}");
+        assert_eq!(v["next_action"], "diag_verify");
 
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"diag_verify","arguments":{{"session":"{sid}","note":"psi 回落"}}}}}}"#
@@ -1413,6 +1843,9 @@ mod tests {
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         let v: Value = serde_json::from_str(text).unwrap();
         assert_eq!(v["phase"], "done");
+        assert_eq!(v["next_action"], "none");
+        assert!(v["report"]["next_action"] == "none");
+        assert!(v["report_path"].as_str().is_some(), "启用持久化的服务应给出报告路径");
         assert!(v["report"]["evidences"].as_array().unwrap().len() >= 2, "证据链可回放");
     }
 
@@ -1425,6 +1858,12 @@ mod tests {
             let v: Value = serde_json::from_str(text).unwrap();
             v["session"].as_str().unwrap().to_string()
         };
+        // 方案必须建立在证据之上
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"diag_add_evidence","arguments":{{"session":"{sid}","source":"proc","fact":"pid 4242 cpu 30%"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        assert_eq!(r["result"]["isError"], false);
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"diag_submit_plan","arguments":{{"session":"{sid}","description":"x","command":{{"kind":"signal","pid":4242,"sig":15}}}}}}}}"#
         );
@@ -1458,7 +1897,10 @@ mod tests {
         let text = r["result"]["content"][0]["text"].as_str().unwrap();
         let v: Value = serde_json::from_str(text).unwrap();
         assert_eq!(v["mode"], "readonly");
-        assert!(v["levels"]["L3_destructive"].is_array());
+        assert!(v["levels"]["L0"].as_array().unwrap().iter().any(|x| x == "system_overview"));
+        assert!(v["levels"]["L0"].as_array().unwrap().iter().any(|x| x == "host_capabilities"));
+        assert!(v["levels"]["L1"].as_array().unwrap().iter().any(|x| x == "diag_abort"));
+        assert!(v["levels"]["L3"].is_null(), "L3 由参数动态升级，不在基础目录里");
     }
 
     #[test]

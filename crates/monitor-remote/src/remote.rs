@@ -324,6 +324,115 @@ pub fn sections(text: &str) -> HashMap<String, String> {
     map
 }
 
+// ---- 远端探针：SSH 桥接到远端 root probe-helper ----
+
+const REMOTE_HELPER: &str = "/usr/local/libexec/system-monitor/probe-helper";
+
+#[derive(Clone, Debug, Default)]
+pub struct ProbeScan {
+    pub kernel_release: String,
+    pub kallsyms: String,
+    pub config: String,
+    pub uid: u32,
+    pub cap_eff: u64,
+    pub tracefs_readable: bool,
+    pub kprobe_events_writable: bool,
+    pub debugfs_readable: bool,
+    pub btf_file: bool,
+    pub unprivileged_bpf_disabled: Option<u32>,
+    pub tools: Vec<(String, bool)>,
+    pub exes: Vec<(i32, String)>,
+    pub helper_ready: bool,
+    pub sweep_ms: u128,
+}
+
+/// 远端 helper 单命令代理：本机 helper 的 `--one-shot` 模式经 SSH 执行。
+/// 命令通过 shell 安全引用后作为参数传入，不走交互式 stdin。
+pub fn probe_exchange(target: &SshTarget, cmd: &str) -> Result<String, String> {
+    let script = format!("{REMOTE_HELPER} --one-shot {}", shell_quote(cmd));
+    let limits = ExecLimits { timeout: Duration::from_secs(20), max_output: 6 * 1024 * 1024 };
+    let out = ssh_exec(target, &script, &limits, None).map_err(|e| format!("远端探针 helper 不可用：{e}"))?;
+    if out.truncated {
+        return Err("远端探针回复被截断".to_string());
+    }
+    Ok(out.stdout)
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 只读扫描远端探针能力与符号（kallsyms 约 3 MB，专用上限）。
+pub fn probe_scan(target: &SshTarget) -> Result<ProbeScan, String> {
+    let started = Instant::now();
+    let limits = ExecLimits { timeout: Duration::from_secs(30), max_output: 32 * 1024 * 1024 };
+    let out = ssh_exec(target, PROBE_SCAN_SCRIPT, &limits, None).map_err(|e| format!("远端扫描失败：{e}"))?;
+    if out.truncated {
+        return Err("远端扫描输出被截断（kallsyms 过大或网络异常）".to_string());
+    }
+    let mut scan = parse_probe_scan(&out.stdout);
+    scan.sweep_ms = started.elapsed().as_millis();
+    scan.helper_ready = probe_exchange(target, "ping").is_ok();
+    Ok(scan)
+}
+
+fn parse_probe_scan(text: &str) -> ProbeScan {
+    let sec = sections(text);
+    let flag = |k: &str| sec.get(k).is_some_and(|s| s.trim() == "1");
+    ProbeScan {
+        kernel_release: sec.get("osrel").map(|s| s.trim().to_string()).unwrap_or_default(),
+        kallsyms: sec.get("kallsyms").cloned().unwrap_or_default(),
+        config: sec.get("config").cloned().unwrap_or_default(),
+        uid: sec.get("uid").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+        cap_eff: sec.get("capeff").and_then(|s| u64::from_str_radix(s.trim(), 16).ok()).unwrap_or(0),
+        tracefs_readable: flag("tracefs"),
+        kprobe_events_writable: flag("kprobew"),
+        debugfs_readable: flag("debugfs"),
+        btf_file: flag("btf"),
+        unprivileged_bpf_disabled: sec.get("bpfdis").and_then(|s| s.trim().parse().ok()),
+        tools: sec
+            .get("tools")
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| {
+                        let (name, value) = l.split_once('=')?;
+                        Some((name.trim().to_string(), value.trim() == "1"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        exes: sec
+            .get("exes")
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| {
+                        let (pid, path) = l.split_once('|')?;
+                        Some((pid.trim().parse().ok()?, path.trim().to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        helper_ready: false,
+        sweep_ms: 0,
+    }
+}
+
+const PROBE_SCAN_SCRIPT: &str = r#"LANG=C
+echo '##osrel'; cat /proc/sys/kernel/osrelease 2>/dev/null
+echo '##uid'; id -u
+echo '##capeff'; sed -n 's/^CapEff:[[:space:]]*//p' /proc/self/status
+echo '##config'; cat /boot/config-$(uname -r) 2>/dev/null
+echo '##tracefs'; [ -r /sys/kernel/tracing/events ] && echo 1 || echo 0
+echo '##kprobew'; [ -w /sys/kernel/tracing/kprobe_events ] && echo 1 || echo 0
+echo '##debugfs'; [ -r /sys/kernel/debug ] && echo 1 || echo 0
+echo '##btf'; [ -e /sys/kernel/btf/vmlinux ] && echo 1 || echo 0
+echo '##bpfdis'; cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null
+echo '##tools'; for t in bpftrace bpftool perf clang; do command -v "$t" >/dev/null 2>&1 && echo "$t=1" || echo "$t=0"; done
+echo '##exes'; for p in /proc/[0-9]*/exe; do pid=${p#/proc/}; pid=${pid%/exe}; path=$(readlink "$p" 2>/dev/null) && printf '%s|%s\n' "$pid" "$path"; done
+echo '##kallsyms'; grep -E '^[0-9a-f]+ [TtWw] ' /proc/kallsyms 2>/dev/null
+echo '##end'
+"#;
+
 fn pct(busy: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
@@ -895,19 +1004,20 @@ fn parse_group_lines(text: &str) -> Vec<GroupState> {
     let mut out = Vec::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split('|').collect();
-        // 5 字段 = 旧格式(无统计)；8 字段 = 含 cpu.stat
-        if f.len() != 5 && f.len() != 8 {
+        // 5 字段 = 旧格式(无统计)；8/9 字段 = 含 cpu.stat（9 字段附带 usage_usec）
+        if f.len() != 5 && f.len() != 8 && f.len() != 9 {
             continue;
         }
         let pids_max = {
             let t = f[3].trim();
             if t.is_empty() || t == "max" { None } else { t.parse().ok() }
         };
-        let throttle = if f.len() == 8 {
+        let throttle = if f.len() >= 8 {
             Some((f[5].trim().parse().unwrap_or(0), f[6].trim().parse().unwrap_or(0), f[7].trim().parse().unwrap_or(0)))
         } else {
             None
         };
+        let usage_usec = if f.len() >= 9 { f[8].trim().parse().unwrap_or(0) } else { 0 };
         out.push(GroupState {
             name: f[0].to_string(),
             cpu_max_pct: cgroup::parse_cpu_max(f[1]),
@@ -915,6 +1025,7 @@ fn parse_group_lines(text: &str) -> Vec<GroupState> {
             pids_max,
             procs: f[4].trim().parse().unwrap_or(0),
             throttle,
+            usage_usec,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -925,8 +1036,8 @@ pub fn cg_list(target: &SshTarget, base: &str) -> Vec<GroupState> {
     let c = format!("{base}/cm-sched");
     let script = format!(
         "cd '{c}' 2>/dev/null || exit 0; for d in */; do [ -d \"$d\" ] || continue; n=${{d%/}}; [ \"$n\" = default ] && continue; \
-p=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_periods //p'); t=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_throttled //p'); u=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^throttled_usec //p'); \
-printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$n\" \"$(cat \"$d/cpu.max\" 2>/dev/null)\" \"$(cat \"$d/cpu.weight\" 2>/dev/null)\" \"$(cat \"$d/pids.max\" 2>/dev/null)\" \"$(grep -c . \"$d/cgroup.procs\" 2>/dev/null)\" \"${{p:-0}}\" \"${{t:-0}}\" \"${{u:-0}}\"; done"
+p=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_periods //p'); t=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_throttled //p'); u=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^throttled_usec //p'); us=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^usage_usec //p'); \
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$n\" \"$(cat \"$d/cpu.max\" 2>/dev/null)\" \"$(cat \"$d/cpu.weight\" 2>/dev/null)\" \"$(cat \"$d/pids.max\" 2>/dev/null)\" \"$(grep -c . \"$d/cgroup.procs\" 2>/dev/null)\" \"${{p:-0}}\" \"${{t:-0}}\" \"${{u:-0}}\" \"${{us:-0}}\"; done"
     );
     parse_group_lines(&ssh_sh(target, &script).unwrap_or_default())
 }
@@ -988,6 +1099,25 @@ pub fn cg_release(target: &SshTarget, original: &str, pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_scan_parse() {
+        let text = "##osrel\n6.8.0\n##uid\n1000\n##capeff\n000001ffffffffff\n##config\nCONFIG_BPF_SYSCALL=y\n##tracefs\n0\n##kprobew\n0\n##debugfs\n1\n##btf\n1\n##bpfdis\n2\n##tools\nperf=1\nbpftool=0\n##exes\n123|/usr/bin/ls\n124|/usr/bin/ls\n##kallsyms\n0000000000000000 T vfs_read\n##end\n";
+        let s = parse_probe_scan(text);
+        assert_eq!(s.kernel_release, "6.8.0");
+        assert_eq!(s.uid, 1000);
+        assert_ne!(s.cap_eff, 0);
+        assert!(s.btf_file);
+        assert_eq!(s.unprivileged_bpf_disabled, Some(2));
+        assert!(s.tools.iter().any(|(n, ok)| n == "perf" && *ok));
+        assert_eq!(s.exes.len(), 2);
+        assert!(s.kallsyms.contains("vfs_read"));
+    }
+
+    #[test]
+    fn probe_shell_quote() {
+        assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
+    }
 
     #[test]
     fn hosts_parse() {

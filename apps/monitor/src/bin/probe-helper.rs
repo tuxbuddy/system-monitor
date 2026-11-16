@@ -39,10 +39,71 @@ extern "C" fn on_term(_sig: libc::c_int) {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--stdio") => {
+            if let Err(e) = run_stdio_proxy() {
+                eprintln!("probe-helper: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--one-shot") => {
+            let Some(cmd) = args.next() else {
+                eprintln!("probe-helper: --one-shot 缺少命令");
+                std::process::exit(2);
+            };
+            if let Err(e) = run_one_shot(&cmd) {
+                eprintln!("probe-helper: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
     if let Err(e) = run() {
         eprintln!("probe-helper: {e}");
         std::process::exit(1);
     }
+}
+
+fn run_one_shot(cmd: &str) -> Result<(), String> {
+    let out = proxy_once(Path::new(&socket_path()), cmd)?;
+    std::io::stdout().write_all(&out).map_err(|e| format!("写 stdout 失败：{e}"))?;
+    Ok(())
+}
+
+fn socket_path() -> String {
+    std::env::var("SM_PROBE_SOCKET").unwrap_or_else(|_| SOCKET_DEFAULT.to_string())
+}
+
+/// 无 root 的 stdio 代理：供 SSH 远端调用，读一行命令，转发给本机 helper socket。
+fn run_stdio_proxy() -> Result<(), String> {
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("读取命令失败：{e}"))?;
+    let cmd = line.trim_end();
+    if cmd.is_empty() {
+        return Err("空命令".to_string());
+    }
+    let out = proxy_once(Path::new(&socket_path()), cmd)?;
+    std::io::stdout().write_all(&out).map_err(|e| format!("写 stdout 失败：{e}"))?;
+    Ok(())
+}
+
+fn proxy_once(socket: &Path, cmd: &str) -> Result<Vec<u8>, String> {
+    use std::net::Shutdown;
+    let mut stream = UnixStream::connect(socket).map_err(|e| format!("连接 helper socket 失败：{e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).map_err(|e| format!("设置超时失败：{e}"))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15))).map_err(|e| format!("设置超时失败：{e}"))?;
+    stream
+        .write_all(cmd.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_err(|e| format!("发送命令失败：{e}"))?;
+    // 半关闭写端：helper 处理完这一条后读到 EOF，关闭连接，代理读到 EOF 即结束。
+    stream.shutdown(Shutdown::Write).map_err(|e| format!("关闭写端失败：{e}"))?;
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).map_err(|e| format!("读取回复失败：{e}"))?;
+    Ok(out)
 }
 
 fn run() -> Result<(), String> {
@@ -259,7 +320,11 @@ impl State {
         } else {
             opts.args.trim().to_string()
         };
-        let entry_line = format!("p:{name} {target} {fetch}\n");
+        let entry_line = if fetch.is_empty() {
+            format!("p:{name} {target}\n")
+        } else {
+            format!("p:{name} {target} {fetch}\n")
+        };
         let ret_line = format!("r:{ret_name} {target} $retval\n");
         let events_file = trace.events_file(opts.kind);
         write_str(&events_file, &entry_line).map_err(|e| format!("写 tracefs 失败：{e}"))?;
@@ -369,8 +434,24 @@ impl State {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn default_args() -> String {
     (0..8).map(|i| format!("arg{i}=%x{i}")).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn default_args() -> String {
+    ["di", "si", "dx", "cx", "r8", "r9"]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("arg{i}=%{r}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn default_args() -> String {
+    String::new()
 }
 
 fn setup_events(events: &[EventPaths], stack: bool, pid: Option<u32>) -> Result<(), String> {
@@ -459,7 +540,8 @@ fn peer_allowed(stream: &UnixStream, allowed: Option<u32>) -> bool {
         return false;
     };
     match allowed {
-        Some(allowed) => uid == allowed,
+        // root SSH 也允许：root 本身已具备全部权限，且便于无普通用户的远端。
+        Some(allowed) => uid == allowed || uid == 0,
         None => uid == 0,
     }
 }
@@ -606,6 +688,13 @@ fn handle_command(cmd: &str, state: &Arc<Mutex<State>>, trace: &Trace) -> String
             }
             "OK\tstopped\n".to_string()
         }
+        Some("elf") => {
+            let path = cmd.strip_prefix("elf").unwrap_or("").trim();
+            match elf_reply(path) {
+                Ok(text) => text,
+                Err(e) => format!("ERR\t{}\n", esc(&e)),
+            }
+        }
         Some("attach") => match parse_attach(cmd).and_then(|opts| {
             let mut st = state.lock().map_err(|_| "状态锁失败".to_string())?;
             st.attach(trace, opts)
@@ -615,6 +704,39 @@ fn handle_command(cmd: &str, state: &Arc<Mutex<State>>, trace: &Trace) -> String
         },
         _ => "ERR\tunknown command\n".to_string(),
     }
+}
+
+fn elf_reply(path: &str) -> Result<String, String> {
+    if path.is_empty()
+        || path.len() > 4096
+        || !path.starts_with('/')
+        || path.chars().any(|c| c.is_control())
+        || !Path::new(path).is_file()
+    {
+        return Err("路径必须是存在的绝对文件".to_string());
+    }
+    let elf = probe::elf_symbols(Path::new(path))?;
+    let mut out = format!(
+        "ELF\t{}\t{}\t{}\n",
+        esc(elf.source),
+        if elf.stripped { 1 } else { 0 },
+        elf.symbols.len()
+    );
+    for s in elf.symbols.iter().take(20000) {
+        out.push_str(&format!(
+            "SYM\t{}\t{}\t{}\t{}\t{}\n",
+            esc(&s.name),
+            s.addr,
+            s.size,
+            s.off.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "-".to_string()),
+            if s.global { 1 } else { 0 }
+        ));
+    }
+    if elf.symbols.len() > 20000 {
+        out.push_str(&format!("TRUNC\t{}\n", elf.symbols.len()));
+    }
+    out.push_str("END\n");
+    Ok(out)
 }
 
 fn parse_attach(line: &str) -> Result<AttachOpts, String> {
@@ -830,8 +952,16 @@ mod tests {
     #[test]
     fn default_register_args() {
         let a = default_args();
-        assert!(a.starts_with("arg0=%x0 "));
-        assert!(a.ends_with("arg7=%x7"));
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(a.starts_with("arg0=%x0 "));
+            assert!(a.ends_with("arg7=%x7"));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(a.starts_with("arg0=%di "));
+            assert!(a.ends_with("arg5=%r9"));
+        }
     }
 
     #[test]
@@ -890,6 +1020,31 @@ mod tests {
         assert!(out.ends_with("END\n"));
         assert!(!out.contains("weird\tname"));
         assert!(out.contains("weird name"));
+    }
+
+    #[test]
+    fn proxy_forwards_one_command() {
+        let path = std::env::temp_dir().join(format!("sm-probe-test-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut cmd = String::new();
+            BufReader::new(s.try_clone().unwrap()).read_line(&mut cmd).unwrap();
+            assert_eq!(cmd, "ping\n");
+            s.write_all(b"OK\tready\n").unwrap();
+        });
+        let out = proxy_once(&path, "ping").unwrap();
+        handle.join().unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "OK\tready\n");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn elf_reply_lists_symbols() {
+        let out = elf_reply("/bin/sh").expect("parse /bin/sh");
+        assert!(out.starts_with("ELF\t"));
+        assert!(out.ends_with("END\n"));
     }
 
     #[test]

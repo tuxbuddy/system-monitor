@@ -207,15 +207,17 @@ fn gpu_slow() -> GpuSlow {
     guard.1.clone()
 }
 
-/// 采集 GPU 信息：V3D 时钟走 debugfs（免 fork），慢变字段走 5s 缓存；失败即 None。
+/// 采集 GPU 信息：V3D 时钟优先 vcgencmd，debugfs 仅作回退。
+/// 某些内核上读 `/sys/kernel/debug/dri/*/measure_clock` 会阻塞约 1 秒，
+/// 比 fork 一次 vcgencmd（约 12ms）慢得多，不能放在快路径上。
 pub fn read_gpu() -> GpuStats {
     let pf = platform::platform();
     if !pf.gpu_enabled {
         return GpuStats::default();
     }
-    let v3d_ghz = read_first(&pf.gpu_clock_debugfs)
-        .and_then(|s| parse_debugfs_clock(&s))
-        .or_else(|| run_vcgencmd(&["measure_clock", "v3d"]).and_then(|s| parse_clock_hz(&s)));
+    let v3d_ghz = run_vcgencmd(&["measure_clock", "v3d"])
+        .and_then(|s| parse_clock_hz(&s))
+        .or_else(|| read_first(&pf.gpu_clock_debugfs).and_then(|s| parse_debugfs_clock(&s)));
     let slow = gpu_slow();
     GpuStats {
         v3d_ghz,

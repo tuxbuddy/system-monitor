@@ -14,6 +14,10 @@ pub struct AppConfig {
     pub alert_temp: f32,
     /// 顶部大盘（KPI 卡片行）是否展开。
     pub dash_open: bool,
+    /// 进程表可选列（逗号分隔：ppid,user,rss,mempct,nice,io,fd,state）。
+    pub proc_cols: String,
+    /// 性能页趋势图时间窗（采样数：120 / 300 / 900）。
+    pub chart_window: u32,
 }
 
 impl Default for AppConfig {
@@ -28,6 +32,8 @@ impl Default for AppConfig {
             alert_mem: 90.0,
             alert_temp: 80.0,
             dash_open: true,
+            proc_cols: "ppid,user,rss,mempct,nice,state".to_string(),
+            chart_window: 120,
         }
     }
 }
@@ -35,7 +41,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn to_text(&self) -> String {
         format!(
-            "sort_col={}\nsort_desc={}\ninterval={}\ntable_mode={}\nown_only={}\nalert_cpu={}\nalert_mem={}\nalert_temp={}\ndash_open={}\n",
+            "sort_col={}\nsort_desc={}\ninterval={}\ntable_mode={}\nown_only={}\nalert_cpu={}\nalert_mem={}\nalert_temp={}\ndash_open={}\nproc_cols={}\nchart_window={}\n",
             self.sort_col,
             self.sort_desc,
             self.interval,
@@ -44,7 +50,9 @@ impl AppConfig {
             self.alert_cpu,
             self.alert_mem,
             self.alert_temp,
-            self.dash_open
+            self.dash_open,
+            self.proc_cols,
+            self.chart_window
         )
     }
 }
@@ -101,6 +109,12 @@ pub fn parse(text: &str) -> AppConfig {
                     c.dash_open = false;
                 }
             }
+            "proc_cols" => c.proc_cols = v.to_string(),
+            "chart_window" => {
+                if let Ok(x) = v.parse() {
+                    c.chart_window = x;
+                }
+            }
             _ => {}
         }
     }
@@ -144,6 +158,8 @@ mod tests {
             alert_mem: 80.0,
             alert_temp: 75.0,
             dash_open: false,
+            proc_cols: "user,cpu".to_string(),
+            chart_window: 300,
         };
         assert_eq!(parse(&c.to_text()), c);
     }
