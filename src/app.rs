@@ -660,11 +660,7 @@ impl CpuManagerApp {
 
     /// 每帧轮询后台结果并回填状态；结果按提交顺序应用。
     fn poll_jobs(&mut self) {
-        loop {
-            let out = match self.job_rx.try_recv() {
-                Ok(o) => o,
-                Err(_) => break,
-            };
+        while let Ok(out) = self.job_rx.try_recv() {
             self.pending_ops = self.pending_ops.saturating_sub(1);
             match out {
                 UiJobOutcome::Report(r, msg) => self.report(r, msg),
@@ -704,7 +700,7 @@ impl CpuManagerApp {
             Some(h) => {
                 let sig = if stopped { libc::SIGCONT } else { libc::SIGSTOP };
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::signal(&h, pid, sig).map_err(|e| ActionError::Other(e)),
+                    remote::signal(&h, pid, sig).map_err(ActionError::Other),
                     msg,
                 ));
                 self.status_error = false;
@@ -724,7 +720,7 @@ impl CpuManagerApp {
             Some(h) => {
                 let s = sig as i32;
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::signal(&h, pid, s).map_err(|e| ActionError::Other(e)),
+                    remote::signal(&h, pid, s).map_err(ActionError::Other),
                     msg,
                 ));
                 self.status_error = false;
@@ -787,7 +783,7 @@ impl CpuManagerApp {
         match self.host_sel.clone() {
             Some(h) => {
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::set_nice(&h, pid, value).map_err(|e| ActionError::Other(e)),
+                    remote::set_nice(&h, pid, value).map_err(ActionError::Other),
                     msg,
                 ));
                 self.status_error = false;
@@ -878,9 +874,6 @@ impl CpuManagerApp {
             self.groups.clear();
         }
     }
-
-
-    /// 远端写调度就绪时返回 (host, base)。
 
     fn remote_write_host(&self) -> Option<remote::SshTarget> {
         if self.remote_write { self.host_sel.clone() } else { None }
