@@ -650,20 +650,20 @@ impl CpuManagerApp {
         }
     }
 
-    fn remote_cg_base_for(&mut self, host: &str) -> Option<String> {
+    fn remote_cg_base_for(&mut self, host: &remote::SshTarget) -> Option<String> {
         if let Some((h, b)) = &self.remote_cg_base
-            && h == host
+            && h == host.as_str()
         {
             return Some(b.clone());
         }
         let base = remote::cg_base(host)?;
         remote::cg_ensure(host, &base);
-        self.remote_cg_base = Some((host.to_string(), base.clone()));
+        self.remote_cg_base = Some((host.as_str().to_string(), base.clone()));
         Some(base)
     }
 
     /// 远端写调度就绪时返回 (host, base)。
-    fn cg_remote(&mut self) -> Option<(String, String)> {
+    fn cg_remote(&mut self) -> Option<(remote::SshTarget, String)> {
         if !self.remote_write {
             return None;
         }
@@ -672,7 +672,7 @@ impl CpuManagerApp {
         Some((h, b))
     }
 
-    fn remote_write_host(&self) -> Option<String> {
+    fn remote_write_host(&self) -> Option<remote::SshTarget> {
         if self.remote_write { self.host_sel.clone() } else { None }
     }
 
@@ -851,7 +851,7 @@ impl CpuManagerApp {
         self.refresh_groups();
     }
 
-    fn append_history(&self) {
+    fn append_history(&mut self) {
         let Some(p) = history_path() else {
             return;
         };
@@ -1931,7 +1931,7 @@ impl CpuManagerApp {
         let (banner, color) = if remote && !remote_write {
             ("远程主机：只读（勾选『允许调度远端』可管理）".to_string(), theme::WARNING)
         } else if remote_write {
-            (format!("远程调度：{}（写，仅本机用户进程）", self.host_sel.clone().unwrap_or_default()), theme::WARNING)
+            (format!("远程调度：{}（写，仅本机用户进程）", self.host_sel.as_ref().map(|t| t.as_str()).unwrap_or("-")), theme::WARNING)
         } else if available {
             ("可调度：用户 cgroup（cpu / pids）".to_string(), theme::SUCCESS)
         } else {
