@@ -1,0 +1,9 @@
+[package]
+name = "monitor-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "system-monitor 领域类型与纯解析层：目标校验、原子文件、PSI、策略、调度状态"
+
+[dependencies]
+serde_json = { workspace = true }

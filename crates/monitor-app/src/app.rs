@@ -7,15 +7,15 @@ use eframe::egui::{self, Color32, Margin, Pos2, RichText, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use nix::sys::signal::Signal;
 
-use crate::actions::{self, ActionError};
-use crate::cgroup::{self, CgroupManager, GroupState};
-use crate::config::{self, AppConfig};
-use crate::pi::{self, PiStats};
-use crate::platform;
-use crate::remote;
-use crate::probe;
-use crate::probeclient;
-use crate::procstats::{self, FsUsage, NetConn, ProcDetails, ProcUsage, Sampler, Usage, app_groups, format_uptime, read_cmdline, read_details, read_filesystems, read_net_conns, tree_order};
+use monitor_linux::actions::{self, ActionError};
+use monitor_linux::cgroup::{self, CgroupManager, GroupState};
+use monitor_core::config::{self, AppConfig};
+use monitor_linux::pi::{self, PiStats};
+use monitor_linux::platform;
+use monitor_remote::remote;
+use monitor_linux::probe;
+use monitor_linux::probeclient;
+use monitor_linux::procstats::{self, FsUsage, NetConn, ProcDetails, ProcUsage, Sampler, Usage, app_groups, format_uptime, read_cmdline, read_details, read_filesystems, read_net_conns, tree_order};
 use crate::scheduler::{self, Action as SchedAction, Config as SchedConfig, Snapshot as SchedSnapshot, State as SchedState};
 use crate::theme;
 
@@ -290,30 +290,30 @@ impl CpuManagerApp {
         start_metrics_server(shared.clone());
         let (job_tx, job_rx) = std::sync::mpsc::channel();
         // 启动对账：上次崩溃/重启遗留的未完成限流，按策略精确恢复或提示
-        let sched_note = match crate::schedstate::load() {
+        let sched_note = match monitor_core::schedstate::load() {
             Some(action) => {
                 let host_of_action = action.host.clone();
                 let group = action.group.clone();
                 match mgr.as_ref().map(|m| m.read_cpu_max(&group)) {
-                    Some(cur) => match crate::schedstate::reconcile(&action, cur.as_deref(), &host_of_action) {
-                        crate::schedstate::Reconcile::RestoreTo(prev) => {
+                    Some(cur) => match monitor_core::schedstate::reconcile(&action, cur.as_deref(), &host_of_action) {
+                        monitor_core::schedstate::Reconcile::RestoreTo(prev) => {
                             let res = mgr.as_ref().map(|m| m.set_cpu_max_raw(&group, &prev));
                             match res {
                                 Some(Ok(())) => {
-                                    crate::schedstate::clear();
+                                    monitor_core::schedstate::clear();
                                     Some((false, format!("已恢复分组 {group} 的限流前状态（{prev}）")))
                                 }
                                 Some(Err(e)) => Some((true, format!("启动恢复分组 {group} 失败：{e}"))),
                                 None => None,
                             }
                         }
-                        crate::schedstate::Reconcile::ExternalChange { current } => Some((
+                        monitor_core::schedstate::Reconcile::ExternalChange { current } => Some((
                             true,
                             format!(
                                 "分组 {group} 的 cpu.max 已被外部修改为「{current}」，不自动覆盖；可手动解除"
                             ),
                         )),
-                        crate::schedstate::Reconcile::Skipped { reason } => Some((true, format!("遗留限流记录跳过：{reason}"))),
+                        monitor_core::schedstate::Reconcile::Skipped { reason } => Some((true, format!("遗留限流记录跳过：{reason}"))),
                     },
                     None => Some((true, format!("遗留限流记录：分组 {group} 无法读取，请人工确认"))),
                 }
@@ -1153,7 +1153,7 @@ impl CpuManagerApp {
             self.usage.net_tx_bps / 1024.0,
         );
         // 原子目录 + 单行上限 + 大小轮转（5 MB × 3 份），失败只报告一次不刷屏
-        if let Err(e) = crate::fsutil::append_line_capped(&p, &line, 5 * 1024 * 1024, 3, 4096)
+        if let Err(e) = monitor_core::fsutil::append_line_capped(&p, &line, 5 * 1024 * 1024, 3, 4096)
             && self.hist_err.as_ref().is_none_or(|prev| prev != &e.to_string())
         {
             self.hist_err = Some(e.to_string());
@@ -1327,19 +1327,19 @@ impl CpuManagerApp {
                 match &committed {
                     SchedAction::Engage { group, pct } => {
                         if let Some(prev) = prev {
-                            let act = crate::schedstate::AppliedAction::now(
+                            let act = monitor_core::schedstate::AppliedAction::now(
                                 "local",
                                 group,
-                                crate::schedstate::normalize_cpu_max(&prev),
+                                monitor_core::schedstate::normalize_cpu_max(&prev),
                                 Some(*pct),
                             );
-                            if let Err(e) = crate::schedstate::save(&act) {
+                            if let Err(e) = monitor_core::schedstate::save(&act) {
                                 self.status_error = true;
                                 self.status = format!("限流状态落盘失败：{e}");
                             }
                         }
                     }
-                    SchedAction::Restore { .. } => crate::schedstate::clear(),
+                    SchedAction::Restore { .. } => monitor_core::schedstate::clear(),
                 }
                 notify("系统监视器 · 自动节流", &note);
             }
@@ -2296,7 +2296,7 @@ impl CpuManagerApp {
                         .desired_width(220.0),
                 );
                 let name = self.new_group.trim().to_string();
-                let valid = crate::cgroup::valid_group_name(&name);
+                let valid = monitor_linux::cgroup::valid_group_name(&name);
                 if action_btn(ui, "创建", theme::SUCCESS, available && valid, false) {
                     self.do_create_group(&name);
                 }
@@ -2362,7 +2362,7 @@ impl CpuManagerApp {
                         ui.selectable_value(&mut self.new_auto_pct, Some(200), "200%");
                         ui.selectable_value(&mut self.new_auto_pct, None, "不限");
                     });
-                let can = !self.new_auto_pattern.trim().is_empty() && crate::cgroup::valid_group_name(self.new_auto_group.trim());
+                let can = !self.new_auto_pattern.trim().is_empty() && monitor_linux::cgroup::valid_group_name(self.new_auto_group.trim());
                 if action_btn(ui, "添加", theme::SUCCESS, can, false) {
                     self.auto_rules.push(AutoRule {
                         pattern: self.new_auto_pattern.trim().to_string(),

@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::mcppolicy::{self, PolicyMode, RiskLevel};
-use crate::pi::PiStats;
-use crate::procstats::{self, FsUsage, NetConn, Sampler, Usage};
-use crate::remote;
+use monitor_core::mcppolicy::{self, PolicyMode, RiskLevel};
+use crate::service::{CgAction, Command, CommandDispatcher};
+use monitor_linux::pi::PiStats;
+use monitor_linux::procstats::{self, FsUsage, NetConn, Sampler, Usage};
+use monitor_remote::remote;
 
 struct View {
     usage: Usage,
@@ -38,10 +39,12 @@ pub struct Server {
     /// 服务端强制策略：默认 readonly，禁止隐式升级。
     policy: PolicyMode,
     caller: String,
+    /// 统一命令执行器（#12）：写操作全部经它（策略+审计+错误归一）。
+    dispatcher: CommandDispatcher,
     sampler: Sampler,
     last_local: Instant,
     remote_prev: HashMap<String, Option<remote::Counters>>,
-    probe: Option<(crate::probe::Snapshot, Instant)>,
+    probe: Option<(monitor_linux::probe::Snapshot, Instant)>,
 }
 
 impl Server {
@@ -51,6 +54,7 @@ impl Server {
             hosts: remote::load_hosts().0,
             policy: PolicyMode::Readonly,
             caller: std::env::var("SM_MCP_CALLER").unwrap_or_else(|_| "stdio".to_string()),
+            dispatcher: CommandDispatcher::new(PolicyMode::Readonly, "mcp"),
             remote_fresh: HashMap::new(),
             sampler: Sampler::new(),
             last_local: Instant::now() - Duration::from_secs(10),
@@ -86,7 +90,7 @@ impl Server {
                 self.last_local = Instant::now();
                 Ok(View {
                     usage,
-                    pi: crate::pi::read_pi_stats(),
+                    pi: monitor_linux::pi::read_pi_stats(),
                     filesystems: procstats::read_filesystems(),
                     conns: procstats::read_net_conns(),
                     label: "本地".to_string(),
@@ -134,10 +138,10 @@ impl Server {
         }
     }
 
-    fn probe_snapshot(&mut self) -> &crate::probe::Snapshot {
+    fn probe_snapshot(&mut self) -> &monitor_linux::probe::Snapshot {
         let stale = self.probe.as_ref().is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(60));
         if stale {
-            self.probe = Some((crate::probe::Snapshot::load(), Instant::now()));
+            self.probe = Some((monitor_linux::probe::Snapshot::load(), Instant::now()));
         }
         &self.probe.as_ref().expect("刚刚写入").0
     }
@@ -305,11 +309,11 @@ impl Server {
                 let (ok, n) = match &host {
                     None => {
                         if tree {
-                            let r = if num == 9 { crate::actions::kill_tree(pid) } else { crate::actions::terminate_tree(pid) };
+                            let r = if num == 9 { monitor_linux::actions::kill_tree(pid) } else { monitor_linux::actions::terminate_tree(pid) };
                             (r.map(|n| n as u64).map_err(|e| e.to_string())?, 0)
                         } else {
                             let signal = local_signal(&sig)?;
-                            crate::actions::send_signal(pid, signal).map_err(|e| e.to_string())?;
+                            monitor_linux::actions::send_signal(pid, signal).map_err(|e| e.to_string())?;
                             (1, 0)
                         }
                     }
@@ -340,7 +344,7 @@ impl Server {
                 let nice = args.get("nice").and_then(|v| v.as_i64()).ok_or("缺少 nice")?.clamp(-20, 19) as i32;
                 let host = self.target(args)?;
                 match &host {
-                    None => crate::actions::set_nice(pid, nice).map_err(|e| e.to_string())?,
+                    None => monitor_linux::actions::set_nice(pid, nice).map_err(|e| e.to_string())?,
                     Some(h) => remote::set_nice(h, pid, nice)?,
                 }
                 Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "pid": pid, "nice": nice}))
@@ -349,17 +353,17 @@ impl Server {
                 let host = args.get("host").and_then(|v| v.as_str());
                 match host {
                     None | Some("local") | Some("") => {
-                        let caps = crate::caps::detect_local();
+                        let caps = monitor_linux::caps::detect_local();
                         let mut v = caps.to_json();
                         v["host"] = json!("local");
                         Ok(v)
                     }
                     Some(h) => {
                         let target = remote::SshTarget::parse(h).map_err(|e| format!("host 参数非法：{e}"))?;
-                        let script = crate::caps::capabilities_script();
+                        let script = monitor_linux::caps::capabilities_script();
                         let out = remote::ssh_exec(&target, &script, &remote::ExecLimits::default(), None)
                             .map_err(|e| format!("远端能力采集失败：{e}"))?;
-                        let mut v = crate::caps::parse_report(&out.stdout).to_json();
+                        let mut v = monitor_linux::caps::parse_report(&out.stdout).to_json();
                         v["host"] = json!(h);
                         Ok(v)
                     }
@@ -387,18 +391,18 @@ impl Server {
                 }))
             }
             "psi_status" => {
-                let snap = crate::psi::read_local();
+                let snap = monitor_core::psi::read_local();
                 // cgroup v2 委派根下的 *.pressure 作为补充源(本地 /proc/pressure 缺失时尤其有用)
                 let cg = std::env::var_os("HOME")
                     .and_then(|_| {
                         let uid = unsafe { libc::getuid() };
                         let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-                        crate::cgroup::parse_self_cgroup(&text, uid)
+                        monitor_linux::cgroup::parse_self_cgroup(&text, uid)
                     })
                     .and_then(|rel| std::fs::read_to_string("/sys/fs/cgroup").ok().map(|_| rel));
                 let cgroup_pressure = cg.map(|rel| {
                     let dir = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
-                    crate::psi::read_cgroup(&dir)
+                    monitor_core::psi::read_cgroup(&dir)
                 });
                 Ok(json!({
                     "host": "local",
@@ -408,7 +412,7 @@ impl Server {
             }
             "scheduler_status" => {
                 // cgroup 调度体检：逐步报告委派/控制器/可写性，失败给修复建议
-                let checks = crate::cgroup::doctor();
+                let checks = monitor_linux::cgroup::doctor();
                 Ok(json!({
                     "host": "local",
                     "ok": checks.iter().all(|c| c.ok),
@@ -419,7 +423,7 @@ impl Server {
                 let host = self.target(args)?;
                 match &host {
                     None => {
-                        let mgr = crate::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
+                        let mgr = monitor_linux::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
                         let groups = mgr.list_groups().map_err(|e| e.to_string())?;
                         Ok(json!({"host": "local", "groups": groups_json(&groups)}))
                     }
@@ -433,7 +437,7 @@ impl Server {
             "scheduler_set_limit" => {
                 let host = self.target(args)?;
                 let group = args.get("group").and_then(|v| v.as_str()).ok_or("缺少 group")?.to_string();
-                if !crate::cgroup::valid_group_name(&group) {
+                if !monitor_linux::cgroup::valid_group_name(&group) {
                     return Err("group 名称非法".to_string());
                 }
                 let pct = args.get("cpu_max_pct").and_then(|v| v.as_u64()).map(|v| v as u32);
@@ -448,7 +452,7 @@ impl Server {
                 }
                 match &host {
                     None => {
-                        let mgr = crate::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
+                        let mgr = monitor_linux::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
                         if let Some(p) = pct {
                             mgr.set_cpu_max(&group, Some(p)).map_err(|e| e.to_string())?;
                         }
@@ -461,10 +465,15 @@ impl Server {
                     }
                     Some(h) => {
                         let base = remote::cg_base(h).ok_or_else(|| "该主机没有可写的用户 cgroup 委派根".to_string())?;
-                        if let Some(p) = pct
-                            && !remote::cg_set_cpu_max(h, &base, &group, Some(p))
-                        {
-                            return Err("设置 cpu.max 失败（分组不存在或权限不足）".to_string());
+                        if let Some(p) = pct {
+                            self.dispatcher
+                                .run(&Command::CgSetRemote {
+                                    target: h.as_str().to_string(),
+                                    base: base.clone(),
+                                    group: group.clone(),
+                                    pct: Some(p),
+                                })
+                                .map_err(|e| e.to_string())?;
                         }
                         if let Some(w) = weight
                             && !remote::cg_set_weight(h, &base, &group, w)
@@ -488,41 +497,30 @@ impl Server {
                 let host = self.target(args)?;
                 let action = args.get("action").and_then(|v| v.as_str()).ok_or("缺少 action（create/delete）")?;
                 let name = args.get("name").and_then(|v| v.as_str()).ok_or("缺少 name")?.to_string();
-                if !crate::cgroup::valid_group_name(&name) {
+                if !monitor_linux::cgroup::valid_group_name(&name) {
                     return Err("分组名非法".to_string());
                 }
+                let cg_action = match action {
+                    "create" => CgAction::Create,
+                    "delete" => CgAction::Delete,
+                    other => return Err(format!("未知 action：{other}")),
+                };
                 match &host {
                     None => {
-                        let mgr = crate::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
-                        match action {
-                            "create" => mgr.create_group(&name).map_err(|e| e.to_string())?,
-                            "delete" => mgr.delete_group(&name).map_err(|e| e.to_string())?,
-                            other => return Err(format!("未知 action：{other}")),
-                        }
+                        self.dispatcher
+                            .run(&Command::CgGroupLocal { action: cg_action, name: name.clone() })
+                            .map_err(|e| e.to_string())?;
                     }
                     Some(h) => {
                         let base = remote::cg_base(h).ok_or_else(|| "该主机没有可写的用户 cgroup 委派根".to_string())?;
-                        match action {
-                            "create" => {
-                                if !remote::cg_create(h, &base, &name) {
-                                    return Err("远端创建失败（名称冲突或权限不足）".to_string());
-                                }
-                                let ready = remote::cg_ensure(h, &base);
-                                if !ready.ok {
-                                    return Err(format!(
-                                        "远端调度容器未就绪（码 {:?}）：{}",
-                                        ready.error_code.unwrap_or(99),
-                                        ready.detail
-                                    ));
-                                }
-                            }
-                            "delete" => {
-                                if !remote::cg_delete(h, &base, &name) {
-                                    return Err("远端删除失败（组内仍有进程或权限不足）".to_string());
-                                }
-                            }
-                            other => return Err(format!("未知 action：{other}")),
-                        }
+                        self.dispatcher
+                            .run(&Command::CgGroupRemote {
+                                action: cg_action,
+                                target: h.as_str().to_string(),
+                                base,
+                                name: name.clone(),
+                            })
+                            .map_err(|e| e.to_string())?;
                     }
                 }
                 Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "action": action, "name": name}))
@@ -621,7 +619,7 @@ impl Server {
                 let stack = args.get("stack").and_then(|v| v.as_bool()).unwrap_or(false);
                 let pid = args.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let extra = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
-                let attach = crate::probeclient::Attach {
+                let attach = monitor_linux::probeclient::Attach {
                     kind,
                     target: target.as_deref(),
                     symbol,
@@ -629,11 +627,11 @@ impl Server {
                     pid,
                     args: extra,
                 };
-                crate::probeclient::attach(&attach)?;
+                monitor_linux::probeclient::attach(&attach)?;
                 Ok(json!({"attached": true, "kind": kind, "symbol": symbol, "stack": stack, "pid": pid}))
             }
             "probe_poll" => {
-                let stats = crate::probeclient::poll()?;
+                let stats = monitor_linux::probeclient::poll()?;
                 Ok(json!({
                     "total": stats.total,
                     "calls": stats.calls.iter().map(|c| json!({
@@ -642,7 +640,7 @@ impl Server {
                 }))
             }
             "probe_detach" => {
-                crate::probeclient::detach()?;
+                monitor_linux::probeclient::detach()?;
                 Ok(json!({"detached": true}))
             }
             other => Err(format!("未知工具：{other}")),
@@ -725,7 +723,7 @@ fn overview_json(v: &View) -> Value {
     })
 }
 
-fn groups_json(groups: &[crate::cgroup::GroupState]) -> Vec<Value> {
+fn groups_json(groups: &[monitor_linux::cgroup::GroupState]) -> Vec<Value> {
     groups
         .iter()
         .map(|g| {
@@ -1016,7 +1014,10 @@ pub fn run() -> std::io::Result<()> {
         .or_else(|| std::env::var("SM_MCP_POLICY").ok());
     if let Some(raw) = raw {
         match PolicyMode::parse(&raw) {
-            Some(m) => server.policy = m,
+            Some(m) => {
+                server.policy = m;
+                server.dispatcher = CommandDispatcher::new(m, "mcp");
+            }
             None => {
                 eprintln!("system-monitor mcp: 非法策略值 \"{raw}\"（可选 readonly / confirm / trusted），拒绝启动");
                 std::process::exit(2);

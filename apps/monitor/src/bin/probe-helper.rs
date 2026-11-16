@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
-#[path = "../probe.rs"]
+#[path = "../../../../crates/monitor-linux/src/probe.rs"]
 mod probe;
 
 const SOCKET_DEFAULT: &str = "/run/system-monitor-probe/probe.sock";

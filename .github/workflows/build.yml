@@ -45,7 +45,7 @@ jobs:
       - name: Clippy（桌面版）
         run: |
           set +e
-          CARGO_TERM_COLOR=never cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy-gui.log
+          CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy-gui.log
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
             sed 's/\x1b\[[0-9;]*m//g' clippy-gui.log | grep -m 10 -E "^(error|warning)" | while IFS= read -r line; do
@@ -54,12 +54,12 @@ jobs:
             sed 's/\x1b\[[0-9;]*m//g' clippy-gui.log | tail -40 | while IFS= read -r line; do echo "::warning title=clippy 尾部::$line"; done
             exit "$code"
           fi
-      - name: 测试（桌面版）
-        run: cargo test --bin system-monitor
+      - name: 测试（桌面版，workspace）
+        run: cargo test --workspace
       - name: Clippy（纯 TUI）
         run: |
           set +e
-          cargo clippy --no-default-features --all-targets -- -D warnings 2>&1 | tee clippy-tui.log
+          cargo clippy --workspace --no-default-features --all-targets -- -D warnings 2>&1 | tee clippy-tui.log
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
             grep -m 8 -E "^(error|warning)" clippy-tui.log | while IFS= read -r line; do
@@ -67,8 +67,8 @@ jobs:
             done
             exit "$code"
           fi
-      - name: 测试（纯 TUI）
-        run: cargo test --no-default-features --bin system-monitor
+      - name: 测试（纯 TUI，workspace）
+        run: cargo test --workspace --no-default-features
 
   # 发行版测试矩阵（#23）：每个容器跑纯 TUI 测试（无 GUI 系统库依赖），
   # 覆盖 libc/内核差异面。特权 helper 与 cgroup/PSI 场景需 VM,在 docs 记录为未验证项。
@@ -99,8 +99,8 @@ jobs:
         run: ${{ matrix.install }}
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: 测试（纯 TUI）
-        run: cargo test --no-default-features --bin system-monitor
+      - name: 测试（纯 TUI，workspace）
+        run: cargo test --workspace --no-default-features
       - name: 记录矩阵结果
         run: echo "distro=${{ matrix.name }} kernel=$(uname -r) result=pass" | tee -a distro-matrix.txt
       - uses: actions/upload-artifact@v4
@@ -154,7 +154,7 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           EOF
       - name: 构建
-        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.flags }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.flags }} -p system-monitor
       - name: 冒烟（仅原生 x86_64）
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: ./target/${{ matrix.target }}/release/system-monitor --help
@@ -190,7 +190,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 运行基准
-        run: cargo bench --no-default-features --bench parse || true
+        run: cargo bench --no-default-features -p system-monitor --bench parse || true
       - uses: actions/upload-artifact@v4
         with:
           name: bench-report

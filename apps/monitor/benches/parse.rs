@@ -5,7 +5,9 @@
 
 use std::time::Instant;
 
-use system_monitor::{procstats, psi, remote, sshtarget};
+use monitor_core::{psi, sshtarget};
+use monitor_linux::procstats;
+use monitor_remote::remote;
 
 const SAMPLE_BLOB: &str = include_str!("fixtures/sample_blob.txt");
 const WARMUP: usize = 200;

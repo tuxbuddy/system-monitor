@@ -19,9 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 
-use crate::pi::PiStats;
-use crate::procstats::{Sampler, Usage, format_uptime};
-use crate::remote;
+use monitor_linux::pi::PiStats;
+use monitor_linux::procstats::{Sampler, Usage, format_uptime};
+use monitor_remote::remote;
 
 const HIST: usize = 60;
 
@@ -120,7 +120,7 @@ impl App {
             return;
         }
         self.usage = self.sampler.sample();
-        self.pi = crate::pi::read_pi_stats();
+        self.pi = monitor_linux::pi::read_pi_stats();
         self.last = Instant::now();
         self.push_hist();
     }
@@ -213,8 +213,8 @@ impl App {
         self.ok(format!("视角：{label}"));
     }
 
-    fn procs(&self) -> Vec<&crate::procstats::ProcUsage> {
-        let mut v: Vec<&crate::procstats::ProcUsage> = self.usage.procs.iter().collect();
+    fn procs(&self) -> Vec<&monitor_linux::procstats::ProcUsage> {
+        let mut v: Vec<&monitor_linux::procstats::ProcUsage> = self.usage.procs.iter().collect();
         match self.sort {
             SortBy::Cpu => v.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal)),
             SortBy::Mem => v.sort_by(|a, b| b.mem_percent.partial_cmp(&a.mem_percent).unwrap_or(std::cmp::Ordering::Equal)),
@@ -245,7 +245,7 @@ impl App {
         if let Some(h) = self.host() {
             if tree {
                 let pairs: Vec<(i32, i32)> = self.usage.procs.iter().map(|p| (p.pid, p.ppid)).collect();
-                let mut pids = crate::procstats::descendants(pid, &pairs);
+                let mut pids = monitor_linux::procstats::descendants(pid, &pairs);
                 pids.push(pid);
                 return match remote::signal_many(&h, &pids, sig) {
                     Ok(n) => (Ok(()), n),
@@ -258,19 +258,19 @@ impl App {
             };
         }
         if tree {
-            let n = 1 + crate::procstats::descendants(pid, &self.pid_pairs()).len();
+            let n = 1 + monitor_linux::procstats::descendants(pid, &self.pid_pairs()).len();
             let r = if sig == 9 {
-                crate::actions::kill_tree(pid).map(|_| ())
+                monitor_linux::actions::kill_tree(pid).map(|_| ())
             } else {
-                crate::actions::terminate_tree(pid).map(|_| ())
+                monitor_linux::actions::terminate_tree(pid).map(|_| ())
             };
             (r.map_err(|e| e.to_string()), n)
         } else {
             let r = match sig {
-                9 => crate::actions::kill_force(pid),
-                18 => crate::actions::stop(pid),
-                19 => crate::actions::resume(pid),
-                _ => crate::actions::terminate(pid),
+                9 => monitor_linux::actions::kill_force(pid),
+                18 => monitor_linux::actions::stop(pid),
+                19 => monitor_linux::actions::resume(pid),
+                _ => monitor_linux::actions::terminate(pid),
             };
             (r.map_err(|e| e.to_string()), 1)
         }
@@ -385,7 +385,7 @@ impl App {
 }
 
 fn config_interval() -> Duration {
-    let secs = crate::config::load().interval;
+    let secs = monitor_core::config::load().interval;
     Duration::from_secs_f32(secs.clamp(0.5, 10.0))
 }
 
@@ -452,7 +452,7 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
         .remote
         .as_ref()
         .map(|r| r.os.clone())
-        .unwrap_or_else(|| crate::platform::platform().os);
+        .unwrap_or_else(|| monitor_linux::platform::platform().os);
     let up = app.usage.uptime_secs.map(format_uptime).unwrap_or_else(|| "—".into());
     let load = app
         .usage
@@ -596,7 +596,7 @@ fn bar(frac: f32, width: usize) -> String {
 }
 
 fn proc_table(f: &mut Frame, area: Rect, app: &mut App) {
-    let procs: Vec<crate::procstats::ProcUsage> = app.procs().into_iter().cloned().collect();
+    let procs: Vec<monitor_linux::procstats::ProcUsage> = app.procs().into_iter().cloned().collect();
     if !procs.is_empty() {
         match app.table.selected() {
             None => app.table.select(Some(0)),
