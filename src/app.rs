@@ -167,6 +167,24 @@ impl PerfHistory {
     }
 }
 
+/// 后台远端操作的结果投递（#15：UI 线程零阻塞）。
+enum UiJobOutcome {
+    /// 通用操作结果（走 report 管道）。
+    Report(Result<(), ActionError>, String),
+    /// 远端写操作结果（ok + 展示消息）。
+    Remote(bool, String),
+    /// 远端 cmdline 读取（缓存回填）。
+    Cmdline(i32, String),
+    /// 远端进程详情。
+    Details(ProcUsage, ProcDetails),
+    /// 远端分组列表刷新。
+    Groups(Vec<cgroup::GroupState>),
+    /// 委派根发现结果（写回 remote_cg_base 缓存）。
+    BaseReady(String, String),
+    /// 远端迁入成功（pid, 原路径）——poll 回填 original_of。
+    MovedIn(i32, PathBuf),
+}
+
 pub struct CpuManagerApp {
     sampler: Sampler,
     usage: Usage,
@@ -252,6 +270,11 @@ pub struct CpuManagerApp {
     hist_err: Option<String>,
     /// 调度熔断告警只提示一次，重新启用后复位。
     sched_halt_warned: bool,
+    /// 后台远端操作通道（#15）：UI 提交，worker 回投结果，ui() 每帧轮询。
+    job_tx: std::sync::mpsc::Sender<UiJobOutcome>,
+    job_rx: std::sync::mpsc::Receiver<UiJobOutcome>,
+    /// 在途后台操作数（用于去重提示与状态展示）。
+    pending_ops: u32,
 }
 
 impl CpuManagerApp {
@@ -265,6 +288,7 @@ impl CpuManagerApp {
         };
         let shared = Arc::new(Mutex::new(SharedMetrics::default()));
         start_metrics_server(shared.clone());
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
         // 启动对账：上次崩溃/重启遗留的未完成限流，按策略精确恢复或提示
         let sched_note = match crate::schedstate::load() {
             Some(action) => {
@@ -392,6 +416,9 @@ impl CpuManagerApp {
             probe_armed_pid: None,
             hist_err: None,
             sched_halt_warned: false,
+            job_tx,
+            job_rx,
+            pending_ops: 0,
         };
         app.saved_cfg = app.current_config();
         if let Some(w) = hosts_warn {
@@ -628,48 +655,138 @@ impl CpuManagerApp {
     }
 
     /// 暂停 / 恢复：远端主机走 SSH kill，本机走 nix。
-    fn act_pause(&mut self, pid: i32, stopped: bool, comm: &str) {
-        let r = match self.host_sel.clone() {
-            Some(h) => remote::signal(&h, pid, if stopped { libc::SIGCONT } else { libc::SIGSTOP }).map_err(Self::remote_err),
-            None => {
-                if stopped {
-                    actions::resume(pid)
-                } else {
-                    actions::stop(pid)
+    /// 提交后台远端操作（#15）：SSH 在 worker 执行，UI 立即返回不阻塞渲染。
+    fn spawn_job<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> UiJobOutcome + Send + 'static,
+    {
+        let tx = self.job_tx.clone();
+        self.pending_ops += 1;
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+    }
+
+    /// 每帧轮询后台结果并回填状态；结果按提交顺序应用。
+    fn poll_jobs(&mut self) {
+        loop {
+            let out = match self.job_rx.try_recv() {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            self.pending_ops = self.pending_ops.saturating_sub(1);
+            match out {
+                UiJobOutcome::Report(r, msg) => self.report(r, msg),
+                UiJobOutcome::Remote(ok, msg) => {
+                    if ok {
+                        self.finish_remote(true, msg);
+                    } else {
+                        self.status_error = true;
+                        self.status = msg;
+                    }
+                }
+                UiJobOutcome::Cmdline(pid, c) => self.cmdline_cache = Some((pid, c)),
+                UiJobOutcome::Details(p, d) => self.details = Some((p, d)),
+                UiJobOutcome::Groups(g) => self.groups = g,
+                UiJobOutcome::BaseReady(host, base) => self.remote_cg_base = Some((host, base)),
+                UiJobOutcome::MovedIn(pid, orig) => {
+                    self.original_of.insert(pid, orig);
+                    self.status_error = false;
+                    // 消息由前置的 Remote(true) 设置;这里只补登记与刷新
+                    if self.host_sel.is_some() && self.remote_write {
+                        self.refresh_groups();
+                    }
+                }
+                UiJobOutcome::Remote(ok, msg) => {
+                    if ok {
+                        self.status_error = false;
+                        self.status = msg;
+                        if self.host_sel.is_some() && self.remote_write {
+                            self.refresh_groups(); // 后台拉取最新分组
+                        }
+                    } else {
+                        self.status_error = true;
+                        self.status = msg;
+                    }
                 }
             }
-        };
+        }
+    }
+
+    fn act_pause(&mut self, pid: i32, stopped: bool, comm: &str) {
         let verb = if stopped { "恢复" } else { "暂停" };
         let where_ = if self.host_sel.is_some() { "（远端）" } else { "" };
-        self.report(r, format!("已{verb}进程 {pid}（{comm}）{where_}"));
+        let msg = format!("已{verb}进程 {pid}（{comm}）{where_}");
+        match self.host_sel.clone() {
+            Some(h) => {
+                let sig = if stopped { libc::SIGCONT } else { libc::SIGSTOP };
+                self.spawn_job(move || UiJobOutcome::Report(
+                    remote::signal(&h, pid, sig).map_err(|e| ActionError::Other(e)),
+                    msg,
+                ));
+                self.status_error = false;
+                self.status = format!("远端操作已提交（后台执行中）：{verb}进程 {pid}（{comm}）");
+            }
+            None => {
+                let r = if stopped { actions::resume(pid) } else { actions::stop(pid) };
+                self.report(r, msg);
+            }
+        }
     }
 
     fn act_signal(&mut self, pid: i32, sig: Signal, label: &str) {
-        let r = match self.host_sel.clone() {
-            Some(h) => remote::signal(&h, pid, sig as i32).map_err(Self::remote_err),
-            None => actions::send_signal(pid, sig),
-        };
         let where_ = if self.host_sel.is_some() { "（远端）" } else { "" };
-        self.report(r, format!("已向进程 {pid} 发送 {label}{where_}"));
+        let msg = format!("已向进程 {pid} 发送 {label}{where_}");
+        match self.host_sel.clone() {
+            Some(h) => {
+                let s = sig as i32;
+                self.spawn_job(move || UiJobOutcome::Report(
+                    remote::signal(&h, pid, s).map_err(|e| ActionError::Other(e)),
+                    msg,
+                ));
+                self.status_error = false;
+                self.status = format!("远端操作已提交（后台执行中）：向进程 {pid} 发送 {label}");
+            }
+            None => {
+                let r = actions::send_signal(pid, sig);
+                self.report(r, msg);
+            }
+        }
     }
 
     /// 结束 / 强制结束 / 结束进程树；返回 (结果, 成功个数)。
+    /// 远端路径转后台执行：立即返回 Ok（真实结果经 poll_jobs 回投状态栏）。
     fn act_finish(&mut self, kind: ConfirmKind, pid: i32, tree: bool) -> (Result<(), ActionError>, usize) {
         let sig = if kind == ConfirmKind::Kill { libc::SIGKILL } else { libc::SIGTERM };
         if let Some(h) = self.host_sel.clone() {
+            let verb = if kind == ConfirmKind::Kill { "强制结束" } else { "结束" };
             if tree {
                 let pairs: Vec<(i32, i32)> = self.usage.procs.iter().map(|p| (p.pid, p.ppid)).collect();
                 let mut pids = procstats::descendants(pid, &pairs);
                 pids.push(pid);
-                return match remote::signal_many(&h, &pids, sig) {
-                    Ok(n) => (Ok(()), n),
-                    Err(e) => (Err(Self::remote_err(e)), 0),
-                };
+                let msg = format!("已结束进程树（根 {pid}，{verb}，远端后台执行）");
+                self.spawn_job(move || {
+                    let out = remote::signal_many(&h, &pids, sig);
+                    match out {
+                        Ok(n) => UiJobOutcome::Report(Ok(()), format!("{msg}：送达 {n} 个进程")),
+                        Err(e) => UiJobOutcome::Report(Err(ActionError::Other(e)), msg),
+                    }
+                });
+                self.status_error = false;
+                self.status = format!("远端操作已提交（后台执行中）：结束进程树 {pid}");
+                return (Ok(()), 0);
             }
-            return match remote::signal(&h, pid, sig) {
-                Ok(()) => (Ok(()), 1),
-                Err(e) => (Err(Self::remote_err(e)), 0),
-            };
+            let msg = format!("已{verb}进程 {pid}（远端后台执行）");
+            self.spawn_job(move || {
+                let out = remote::signal(&h, pid, sig);
+                match out {
+                    Ok(()) => UiJobOutcome::Report(Ok(()), msg),
+                    Err(e) => UiJobOutcome::Report(Err(ActionError::Other(e)), msg),
+                }
+            });
+            self.status_error = false;
+            self.status = format!("远端操作已提交（后台执行中）：{verb}进程 {pid}");
+            return (Ok(()), 0);
         }
         let r = if kind == ConfirmKind::Kill {
             if tree { actions::kill_tree(pid).map(|_| ()) } else { actions::kill_force(pid) }
@@ -682,17 +799,40 @@ impl CpuManagerApp {
     }
 
     fn act_set_nice(&mut self, pid: i32, value: i32, comm: &str) {
-        let r = match self.host_sel.clone() {
-            Some(h) => remote::set_nice(&h, pid, value).map_err(Self::remote_err),
-            None => actions::set_nice(pid, value),
-        };
         let where_ = if self.host_sel.is_some() { "（远端）" } else { "" };
-        self.report(r, format!("已将进程 {pid}（{comm}）的 nice 调整为 {value}{where_}"));
+        let msg = format!("已将进程 {pid}（{comm}）的 nice 调整为 {value}{where_}");
+        match self.host_sel.clone() {
+            Some(h) => {
+                self.spawn_job(move || UiJobOutcome::Report(
+                    remote::set_nice(&h, pid, value).map_err(|e| ActionError::Other(e)),
+                    msg,
+                ));
+                self.status_error = false;
+                self.status = format!("远端操作已提交（后台执行中）：调整 nice {pid}");
+            }
+            None => {
+                let r = actions::set_nice(pid, value);
+                self.report(r, msg);
+            }
+        }
     }
 
     fn copy_cmdline(&mut self, pid: i32, comm: &str) -> String {
         let mut c = match self.host_sel.clone() {
-            Some(h) => remote::read_cmdline(&h, pid).unwrap_or_default(),
+            // 远端：命中缓存直接用；否则后台读取（UI 不阻塞），先给占位
+            Some(h) => {
+                let cached = self.cmdline_cache.as_ref().filter(|(p, _)| *p == pid).map(|(_, c)| c.clone());
+                match cached {
+                    Some(c) => c,
+                    None => {
+                        self.spawn_job(move || {
+                            let c = remote::read_cmdline(&h, pid).unwrap_or_default();
+                            UiJobOutcome::Cmdline(pid, c)
+                        });
+                        format!("[{comm}]（cmdline 后台读取中…）")
+                    }
+                }
+            }
             None => read_cmdline(pid),
         };
         if c.is_empty() {
@@ -702,11 +842,23 @@ impl CpuManagerApp {
     }
 
     fn open_details(&mut self, p: &ProcUsage) {
-        let d = match self.host_sel.clone() {
-            Some(h) => remote::read_details(&h, p.pid).unwrap_or_default(),
-            None => read_details(p.pid),
-        };
-        self.details = Some((p.clone(), d));
+        match self.host_sel.clone() {
+            Some(h) => {
+                // 先弹壳（本地已知的 proc 摘要 + 「加载中」），详情后台回填
+                self.details = Some((p.clone(), ProcDetails::default()));
+                let snapshot = p.clone();
+                self.spawn_job(move || {
+                    let d = remote::read_details(&h, snapshot.pid).unwrap_or_default();
+                    UiJobOutcome::Details(snapshot, d)
+                });
+                self.status_error = false;
+                self.status = format!("远端详情后台读取中：进程 {}", p.pid);
+            }
+            None => {
+                let d = read_details(p.pid);
+                self.details = Some((p.clone(), d));
+            }
+        }
     }
 
     fn refresh_groups(&mut self) {
@@ -715,11 +867,26 @@ impl CpuManagerApp {
                 self.groups.clear();
                 return;
             }
-            let base = self.remote_cg_base_for(&h);
-            self.groups = match base {
-                Some(b) => remote::cg_list(&h, &b),
-                None => Vec::new(),
-            };
+            // 远端列表后台拉取（含 base 发现），UI 不阻塞
+            let cached_base = self.remote_cg_base.as_ref().map(|(_, b)| b.clone());
+            let tx = self.job_tx.clone();
+            let host_key = h.as_str().to_string();
+            self.spawn_job(move || {
+                let base = match cached_base {
+                    Some(b) => Some(b),
+                    None => remote::cg_base(&h).and_then(|b| {
+                        let ready = remote::cg_ensure(&h, &b);
+                        ready.ok.then_some(b)
+                    }),
+                };
+                match base {
+                    Some(b) => {
+                        let _ = tx.send(UiJobOutcome::BaseReady(host_key, b.clone()));
+                        UiJobOutcome::Groups(remote::cg_list(&h, &b))
+                    }
+                    None => UiJobOutcome::Groups(Vec::new()),
+                }
+            });
             return;
         }
         if let Some(m) = &self.mgr {
@@ -790,14 +957,51 @@ impl CpuManagerApp {
         }
     }
 
-    fn do_create_group(&mut self, name: &str) {
-        if let Some((h, base)) = self.cg_remote() {
-            let ok = remote::cg_create(&h, &base, name);
-            if ok {
-                self.sel_group = Some(name.to_string());
-                self.new_group.clear();
+    /// cgroup 远端写操作后台分发（#15）：base 发现→ensure→op 全在 worker。
+    /// op 返回 Err(原因) 时该原因直达状态栏；Ok 则展示 ok_msg 并刷新分组。
+    fn dispatch_cg(&mut self, ok_msg: String, op: impl FnOnce(&remote::SshTarget, &str) -> Result<(), String> + Send + 'static) {
+        let Some(h) = self.host_sel.clone() else { return };
+        let cached_base = self.remote_cg_base.as_ref().map(|(_, b)| b.clone());
+        self.spawn_job(move || {
+            let base = match cached_base {
+                Some(b) => b,
+                None => match remote::cg_base(&h) {
+                    Some(b) => {
+                        let ready = remote::cg_ensure(&h, &b);
+                        if !ready.ok {
+                            return UiJobOutcome::Remote(
+                                false,
+                                format!("远端调度容器未就绪（码 {:?}）：{}", ready.error_code.unwrap_or(99), ready.detail),
+                            );
+                        }
+                        b
+                    }
+                    None => return UiJobOutcome::Remote(false, "该主机没有可写的用户 cgroup 委派根".to_string()),
+                },
+            };
+            match op(&h, &base) {
+                Ok(()) => UiJobOutcome::Remote(true, ok_msg),
+                Err(e) => UiJobOutcome::Remote(false, e),
             }
-            self.finish_remote(ok, format!("已创建分组 {name}（远程）"));
+        });
+        self.status_error = false;
+        self.status = "远端调度操作已提交（后台执行中）…".to_string();
+    }
+
+    /// 远端写模式就绪（host 已选且开关打开）。
+    fn cg_remote_enabled(&self) -> bool {
+        self.remote_write && self.host_sel.is_some()
+    }
+
+    fn do_create_group(&mut self, name: &str) {
+        if self.cg_remote_enabled() {
+            let n = name.to_string();
+            let msg = format!("已创建分组 {name}（远程）");
+            self.dispatch_cg(msg, move |h, base| {
+                remote::cg_create(h, base, &n).then_some(()).ok_or_else(|| "远端创建失败（名称冲突或权限不足）".to_string())
+            });
+            self.sel_group = Some(name.to_string());
+            self.new_group.clear();
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.create_group(name));
@@ -809,10 +1013,13 @@ impl CpuManagerApp {
     }
 
     fn do_set_cpu_max(&mut self, group: &str, pct: Option<u32>) {
-        if let Some((h, base)) = self.cg_remote() {
-            let ok = remote::cg_set_cpu_max(&h, &base, group, pct);
+        if self.cg_remote_enabled() {
+            let g = group.to_string();
             let cap = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "不限".into());
-            self.finish_remote(ok, format!("分组 {group} CPU 上限 → {cap}（远程）"));
+            let msg = format!("分组 {group} CPU 上限 → {cap}（远程）");
+            self.dispatch_cg(msg, move |h, base| {
+                remote::cg_set_cpu_max(h, base, &g, pct).then_some(()).ok_or_else(|| "设置 cpu.max 失败（分组不存在或权限不足）".to_string())
+            });
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.set_cpu_max(group, pct));
@@ -821,9 +1028,12 @@ impl CpuManagerApp {
     }
 
     fn do_set_cpu_weight(&mut self, group: &str, weight: u32) {
-        if let Some((h, base)) = self.cg_remote() {
-            let ok = remote::cg_set_weight(&h, &base, group, weight);
-            self.finish_remote(ok, format!("分组 {group} 权重 → {weight}（远程）"));
+        if self.cg_remote_enabled() {
+            let g = group.to_string();
+            let msg = format!("分组 {group} 权重 → {weight}（远程）");
+            self.dispatch_cg(msg, move |h, base| {
+                remote::cg_set_weight(h, base, &g, weight).then_some(()).ok_or_else(|| "设置 cpu.weight 失败".to_string())
+            });
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.set_cpu_weight(group, weight));
@@ -831,10 +1041,13 @@ impl CpuManagerApp {
     }
 
     fn do_set_pids_max(&mut self, group: &str, max: Option<u32>) {
-        if let Some((h, base)) = self.cg_remote() {
-            let ok = remote::cg_set_pids(&h, &base, group, max);
+        if self.cg_remote_enabled() {
+            let g = group.to_string();
             let cap = max.map(|m| m.to_string()).unwrap_or_else(|| "不限".into());
-            self.finish_remote(ok, format!("分组 {group} 进程数上限 → {cap}（远程）"));
+            let msg = format!("分组 {group} 进程数上限 → {cap}（远程）");
+            self.dispatch_cg(msg, move |h, base| {
+                remote::cg_set_pids(h, base, &g, max).then_some(()).ok_or_else(|| "设置 pids.max 失败".to_string())
+            });
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.set_pids_max(group, max));
@@ -843,19 +1056,36 @@ impl CpuManagerApp {
     }
 
     fn do_join_group(&mut self, group: &str, pid: i32) {
-        if let Some((h, base)) = self.cg_remote() {
-            match remote::cg_move_in(&h, &base, group, pid) {
-                Some(orig) => {
-                    self.original_of.insert(pid, PathBuf::from(orig));
-                    self.status_error = false;
-                    self.status = format!("进程 {pid} 已加入分组 {group}（远程）");
-                    self.refresh_groups();
+        if self.cg_remote_enabled() {
+            let h = self.host_sel.clone().expect("cg_remote_enabled 已确认 host");
+            let g = group.to_string();
+            let msg = format!("进程 {pid} 已加入分组 {group}（远程）");
+            let cached_base = self.remote_cg_base.as_ref().map(|(_, b)| b.clone());
+            let tx = self.job_tx.clone();
+            self.spawn_job(move || {
+                let base = match cached_base {
+                    Some(b) => b,
+                    None => match remote::cg_base(&h) {
+                        Some(b) => {
+                            let ready = remote::cg_ensure(&h, &b);
+                            if !ready.ok {
+                                return UiJobOutcome::Remote(false, format!("远端调度容器未就绪（码 {:?}）：{}", ready.error_code.unwrap_or(99), ready.detail));
+                            }
+                            b
+                        }
+                        None => return UiJobOutcome::Remote(false, "该主机没有可写的用户 cgroup 委派根".to_string()),
+                    },
+                };
+                match remote::cg_move_in(&h, &base, &g, pid) {
+                    Some(orig) => {
+                        let _ = tx.send(UiJobOutcome::MovedIn(pid, PathBuf::from(orig)));
+                        UiJobOutcome::Remote(true, msg)
+                    }
+                    None => UiJobOutcome::Remote(false, "远程迁入失败（主机/权限/委派）".to_string()),
                 }
-                None => {
-                    self.status_error = true;
-                    self.status = "远程迁入失败（主机/权限/委派）".to_string();
-                }
-            }
+            });
+            self.status_error = false;
+            self.status = "远端迁移已提交（后台执行中）…".to_string();
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.move_in(group, pid));
@@ -878,8 +1108,12 @@ impl CpuManagerApp {
         if let Some(h) = self.remote_write_host() {
             self.auto_skip.insert(pid);
             if let Some(orig) = self.original_of.remove(&pid) {
-                let ok = remote::cg_release(&h, &orig.to_string_lossy(), pid);
-                self.finish_remote(ok, format!("进程 {pid} 已移出分组（远程）"));
+                let orig_str = orig.to_string_lossy().to_string();
+                let msg = format!("进程 {pid} 已移出分组（远程）");
+                self.spawn_job(move || {
+                    let ok = remote::cg_release(&h, &orig_str, pid);
+                    UiJobOutcome::Remote(ok, if ok { msg } else { "远程移出失败（主机/权限）".to_string() })
+                });
             }
             return;
         }
@@ -892,12 +1126,15 @@ impl CpuManagerApp {
     }
 
     fn do_delete_group(&mut self, group: &str) {
-        if let Some((h, base)) = self.cg_remote() {
-            let ok = remote::cg_delete(&h, &base, group);
+        if self.cg_remote_enabled() {
+            let g = group.to_string();
+            let msg = format!("已删除分组 {group}（远程）");
+            self.dispatch_cg(msg, move |h, base| {
+                remote::cg_delete(h, base, &g).then_some(()).ok_or_else(|| "远端删除失败（组内仍有进程或权限不足）".to_string())
+            });
             if self.sel_group.as_deref() == Some(group) {
                 self.sel_group = None;
             }
-            self.finish_remote(ok, format!("已删除分组 {group}（远程）"));
             return;
         }
         let res = self.mgr.as_ref().map(|m| m.delete_group(group));
@@ -908,18 +1145,35 @@ impl CpuManagerApp {
     }
 
     fn dissolve_all_limits(&mut self) {
-        if let Some((h, base)) = self.cg_remote() {
+        if self.cg_remote_enabled() {
+            let h = self.host_sel.clone().expect("cg_remote_enabled 已确认 host");
             let names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
-            for n in &names {
-                remote::cg_set_cpu_max(&h, &base, n, None);
-            }
             let origs: Vec<(i32, PathBuf)> = self.original_of.drain().collect();
-            for (pid, orig) in &origs {
-                remote::cg_release(&h, &orig.to_string_lossy(), *pid);
-            }
+            let orig_strs: Vec<(i32, String)> = origs.iter().map(|(p, o)| (*p, o.to_string_lossy().to_string())).collect();
+            let cached_base = self.remote_cg_base.as_ref().map(|(_, b)| b.clone());
+            self.spawn_job(move || {
+                let Some(base) = (match cached_base {
+                    Some(b) => Some(b),
+                    None => remote::cg_base(&h),
+                }) else {
+                    return UiJobOutcome::Remote(false, "该主机没有可写的用户 cgroup 委派根".to_string());
+                };
+                let mut ok_count = 0usize;
+                for n in &names {
+                    if remote::cg_set_cpu_max(&h, &base, n, None) {
+                        ok_count += 1;
+                    }
+                }
+                let mut released = 0usize;
+                for (pid, orig) in &orig_strs {
+                    if remote::cg_release(&h, orig, *pid) {
+                        released += 1;
+                    }
+                }
+                UiJobOutcome::Remote(true, format!("已解除 {ok_count}/{} 个分组限速、放回 {released}/{} 个进程（远程）", names.len(), orig_strs.len()))
+            });
             self.status_error = false;
-            self.status = "已解除全部限速（远程）".to_string();
-            self.refresh_groups();
+            self.status = "远端解除全部限速已提交（后台执行中）…".to_string();
             return;
         }
         let names: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
@@ -3685,6 +3939,8 @@ impl CpuManagerApp {
 impl eframe::App for CpuManagerApp {
     // eframe 0.37 将 App::update 改为 App::ui（传入根 Ui）；面板 API 相应改为 show(ui, …)。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 后台远端操作结果回填（#15）：每帧第一件事，不阻塞本次渲染
+        self.poll_jobs();
         if (self.mini || self.view != View::Probe) && self.probe_armed.is_some() {
             self.probe_stop();
         }
