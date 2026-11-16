@@ -3,6 +3,11 @@ use std::time::{Duration, Instant};
 #[derive(Clone)]
 pub struct Config {
     pub enabled: bool,
+    pub mode: Mode,
+    /// PSI cpu some 触发阈值（avg10 百分比）。
+    pub psi_cpu_threshold: f32,
+    /// PSI io some 触发阈值。
+    pub psi_io_threshold: f32,
     pub temp_high: f32,
     pub temp_low: f32,
     pub cpu_high: f32,
@@ -15,6 +20,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: Mode::Recommend,
+            psi_cpu_threshold: 40.0,
+            psi_io_threshold: 50.0,
             temp_high: 80.0,
             temp_low: 70.0,
             cpu_high: 90.0,
@@ -25,12 +33,26 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Snapshot {
     pub temp_c: Option<f32>,
     pub cpu_percent: f32,
     pub throttled: bool,
     pub undervoltage: bool,
+    /// PSI cpu some avg10（0-100）；内核未启用 PSI 为 None。
+    pub psi_cpu_some10: Option<f32>,
+    /// PSI io some avg10。
+    pub psi_io_some10: Option<f32>,
+}
+
+/// 运行模式（#28）：默认 recommend（只建议不执行）；auto 需显式开启。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Mode {
+    /// 只产出建议（Decision），不自动执行动作。
+    #[default]
+    Recommend,
+    /// 自动执行（仍只允许 L2 可恢复动作）。
+    Auto,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -89,9 +111,36 @@ impl State {
     }
 }
 
-/// 纯函数策略评估：依据当前状态与快照决定建议动作，无任何副作用。
-/// 状态迁移由调用方在动作执行成功后经 [`State::commit`] 完成。
+/// 可解释决策（#28）：每个动作携带触发信号与阈值,前端/会话直接展示。
+#[derive(Clone, PartialEq, Debug)]
+pub struct Decision {
+    pub action: Action,
+    /// 触发证据：形如 "cpu 95.0% ≥ 90.0%" / "psi.cpu.some(avg10) 45.2 ≥ 40.0"。
+    pub reasons: Vec<String>,
+    /// 证据条数（≥2 视为高置信；单信号为 medium）。
+    pub confidence: Confidence,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Confidence {
+    /// 2+ 个独立信号同时触发。
+    High,
+    /// 单信号触发。
+    Medium,
+}
+
+/// 纯函数策略评估 v2：多信号输入 + 可解释决策。
+/// 旧 evaluate 保留为薄包装（兼容既有调用与测试）。
 pub fn evaluate(cfg: &Config, snap: &Snapshot, st: &State, now: Instant) -> Vec<Action> {
+    evaluate_v2(cfg, snap, st, now).into_iter().map(|d| d.action).collect()
+}
+
+/// 推荐模式入口：只产出建议，调用方（GUI/MCP）展示,不自动执行。
+pub fn recommend(cfg: &Config, snap: &Snapshot, st: &State, now: Instant) -> Vec<Decision> {
+    evaluate_v2(cfg, snap, st, now)
+}
+
+fn evaluate_v2(cfg: &Config, snap: &Snapshot, st: &State, now: Instant) -> Vec<Decision> {
     if !cfg.enabled || st.halted || st.in_backoff(now) {
         return vec![];
     }
@@ -101,22 +150,67 @@ pub fn evaluate(cfg: &Config, snap: &Snapshot, st: &State, now: Instant) -> Vec<
     let cooled = st
         .last_change
         .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(cfg.cooldown_secs));
-    let hot = snap.temp_c.is_some_and(|t| t >= cfg.temp_high)
-        || snap.cpu_percent >= cfg.cpu_high
-        || snap.throttled
-        || snap.undervoltage;
+
+    // 多信号收集：CPU 高不一定异常——PSI 正常时降权处理（防止误限流编译机）
+    let mut engage_reasons = Vec::new();
+    if snap.temp_c.is_some_and(|t| t >= cfg.temp_high) {
+        engage_reasons.push(format!("temp {:.1}°C ≥ {:.1}°C", snap.temp_c.unwrap(), cfg.temp_high));
+    }
+    if snap.cpu_percent >= cfg.cpu_high {
+        engage_reasons.push(format!("cpu {:.1}% ≥ {:.1}%", snap.cpu_percent, cfg.cpu_high));
+    }
+    if snap.psi_cpu_some10.is_some_and(|v| v >= cfg.psi_cpu_threshold) {
+        engage_reasons.push(format!(
+            "psi.cpu.some(avg10) {:.1} ≥ {:.1}",
+            snap.psi_cpu_some10.unwrap(),
+            cfg.psi_cpu_threshold
+        ));
+    }
+    if snap.psi_io_some10.is_some_and(|v| v >= cfg.psi_io_threshold) {
+        engage_reasons.push(format!(
+            "psi.io.some(avg10) {:.1} ≥ {:.1}",
+            snap.psi_io_some10.unwrap(),
+            cfg.psi_io_threshold
+        ));
+    }
+    if snap.throttled {
+        engage_reasons.push("硬件已频率受限(throttled)".to_string());
+    }
+    if snap.undervoltage {
+        engage_reasons.push("欠压(undervoltage)".to_string());
+    }
+
     let cool = snap.temp_c.is_some_and(|t| t <= cfg.temp_low)
         && snap.cpu_percent < cfg.cpu_high
         && !snap.throttled
-        && !snap.undervoltage;
+        && !snap.undervoltage
+        && !snap.psi_cpu_some10.is_some_and(|v| v >= cfg.psi_cpu_threshold);
 
-    if !st.engaged && hot && cooled {
-        vec![Action::Engage { group, pct: cfg.throttle_pct }]
-    } else if st.engaged && cool && cooled {
-        vec![Action::Restore { group }]
-    } else {
-        vec![]
+    if !st.engaged && cooled && !engage_reasons.is_empty() {
+        // 误限流防线：仅 cpu 高但 PSI 正常 → 降级为单信号(medium),且要求
+        // cpu 超阈值更多才触发（滞回余量 5%）
+        if engage_reasons.len() == 1
+            && engage_reasons[0].starts_with("cpu ")
+            && snap.psi_cpu_some10.is_none_or(|v| v < cfg.psi_cpu_threshold)
+            && snap.cpu_percent < cfg.cpu_high + 5.0
+        {
+            return vec![];
+        }
+        let confidence = if engage_reasons.len() >= 2 { Confidence::High } else { Confidence::Medium };
+        return vec![Decision {
+            action: Action::Engage { group, pct: cfg.throttle_pct },
+            reasons: engage_reasons,
+            confidence,
+        }];
     }
+    if st.engaged && cooled && cool {
+        return vec![Decision {
+            action: Action::Restore { group },
+            reasons: vec!["全部信号回落至恢复带".to_string()],
+            confidence: Confidence::High,
+        }];
+    }
+    vec![]
 }
 
 #[cfg(test)]
@@ -128,18 +222,18 @@ mod tests {
     }
 
     fn hot_snap() -> Snapshot {
-        Snapshot { temp_c: Some(95.0), cpu_percent: 0.0, throttled: false, undervoltage: false }
+        Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(95.0), cpu_percent: 0.0, throttled: false, undervoltage: false }
     }
 
     fn cool_snap() -> Snapshot {
-        Snapshot { temp_c: Some(60.0), cpu_percent: 0.0, throttled: false, undervoltage: false }
+        Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(60.0), cpu_percent: 0.0, throttled: false, undervoltage: false }
     }
 
     #[test]
     fn engages_on_high_cpu() {
         let st = State::default();
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(50.0), cpu_percent: 95.0, throttled: false, undervoltage: false };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(50.0), cpu_percent: 95.0, throttled: false, undervoltage: false };
         assert_eq!(evaluate(&c, &s, &st, Instant::now()), vec![Action::Engage { group: "g".into(), pct: 50 }]);
     }
 
@@ -224,7 +318,7 @@ mod tests {
     fn disabled_does_nothing() {
         let st = State::default();
         let c = Config { enabled: false, target_group: Some("g".into()), ..Config::default() };
-        let s = Snapshot { temp_c: Some(99.0), throttled: true, undervoltage: true, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(99.0), throttled: true, undervoltage: true, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, Instant::now()).is_empty());
     }
 
@@ -232,7 +326,7 @@ mod tests {
     fn no_target_group_does_nothing() {
         let st = State::default();
         let c = Config { enabled: true, target_group: None, ..Config::default() };
-        let s = Snapshot { temp_c: Some(99.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(99.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, Instant::now()).is_empty());
     }
 
@@ -240,7 +334,7 @@ mod tests {
     fn engages_on_high_temp() {
         let st = State::default();
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(85.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(85.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert_eq!(evaluate(&c, &s, &st, Instant::now()), vec![Action::Engage { group: "g".into(), pct: 50 }]);
     }
 
@@ -248,7 +342,7 @@ mod tests {
     fn engages_on_throttle_even_if_cool() {
         let st = State::default();
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(50.0), throttled: true, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(50.0), throttled: true, undervoltage: false, cpu_percent: 0.0 };
         assert_eq!(evaluate(&c, &s, &st, Instant::now()), vec![Action::Engage { group: "g".into(), pct: 50 }]);
     }
 
@@ -256,7 +350,7 @@ mod tests {
     fn stays_engaged_in_hysteresis_band() {
         let st = State { engaged: true, last_change: None, ..State::default() };
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(75.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(75.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, Instant::now()).is_empty());
     }
 
@@ -265,7 +359,7 @@ mod tests {
         let base = Instant::now();
         let st = State { engaged: true, last_change: Some(base), ..State::default() };
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(68.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(68.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert_eq!(evaluate(&c, &s, &st, base + Duration::from_secs(21)), vec![Action::Restore { group: "g".into() }]);
     }
 
@@ -274,7 +368,7 @@ mod tests {
         let base = Instant::now();
         let st = State { engaged: true, last_change: Some(base), ..State::default() };
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(60.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(60.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, base + Duration::from_secs(5)).is_empty());
     }
 
@@ -283,7 +377,7 @@ mod tests {
         let base = Instant::now();
         let st = State { engaged: false, last_change: Some(base), ..State::default() };
         let c = cfg_on();
-        let s = Snapshot { temp_c: Some(90.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: Some(90.0), throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, base + Duration::from_secs(3)).is_empty());
     }
 
@@ -291,7 +385,81 @@ mod tests {
     fn none_temp_does_not_release() {
         let st = State { engaged: true, last_change: None, ..State::default() };
         let c = cfg_on();
-        let s = Snapshot { temp_c: None, throttled: false, undervoltage: false, cpu_percent: 0.0 };
+        let s = Snapshot { psi_cpu_some10: None, psi_io_some10: None, temp_c: None, throttled: false, undervoltage: false, cpu_percent: 0.0 };
         assert!(evaluate(&c, &s, &st, Instant::now()).is_empty());
+    }
+
+    // ---- v2 仿真（#28）----
+
+    fn cfg_auto() -> Config {
+        Config { enabled: true, mode: Mode::Auto, target_group: Some("g".into()), ..Config::default() }
+    }
+
+    fn snap(cpu: f32, psi_cpu: Option<f32>, psi_io: Option<f32>, temp: Option<f32>) -> Snapshot {
+        Snapshot { temp_c: temp, cpu_percent: cpu, throttled: false, undervoltage: false, psi_cpu_some10: psi_cpu, psi_io_some10: psi_io }
+    }
+
+    #[test]
+    fn high_cpu_with_normal_psi_is_dampened() {
+        // 高 CPU 但 PSI 正常:编译机常态,不应误限流
+        let st = State::default();
+        let c = cfg_auto();
+        assert!(evaluate_v2(&c, &snap(91.0, Some(8.0), Some(3.0), None), &st, Instant::now()).is_empty());
+        // cpu 超出阈值+滞回余量才触发(单信号 medium)
+        let d = evaluate_v2(&c, &snap(96.0, Some(8.0), Some(3.0), None), &st, Instant::now());
+        assert!(matches!(d[0].confidence, Confidence::Medium));
+    }
+
+    #[test]
+    fn high_cpu_with_psi_pressure_is_high_confidence() {
+        let st = State::default();
+        let c = cfg_auto();
+        let d = evaluate_v2(&c, &snap(95.0, Some(45.0), Some(3.0), None), &st, Instant::now());
+        assert!(!d.is_empty());
+        assert!(matches!(d[0].confidence, Confidence::High), "双信号应高置信：{d:?}");
+        assert_eq!(d[0].reasons.len(), 2);
+        assert!(d[0].reasons.iter().any(|r| r.contains("psi.cpu")));
+    }
+
+    #[test]
+    fn io_pressure_alone_triggers_medium() {
+        let st = State::default();
+        let c = cfg_auto();
+        let d = evaluate_v2(&c, &snap(10.0, Some(2.0), Some(60.0), None), &st, Instant::now());
+        assert!(!d.is_empty());
+        assert!(d[0].reasons.iter().any(|r| r.contains("psi.io")));
+    }
+
+    #[test]
+    fn oscillation_is_dampened_by_cooldown_and_hysteresis() {
+        let mut st = State::default();
+        let c = cfg_auto();
+        let mut now = Instant::now();
+        // 触发
+        let d = evaluate_v2(&c, &snap(95.0, Some(45.0), None, Some(85.0)), &st, now);
+        assert_eq!(d.len(), 1);
+        st.commit(&d[0].action, true, now);
+        // 冷却期内即使指标来回摆动也不动作
+        for i in 0..4 {
+            now += Duration::from_secs(4);
+            let s = if i % 2 == 0 { snap(20.0, Some(1.0), None, Some(65.0)) } else { snap(99.0, Some(90.0), None, Some(95.0)) };
+            assert!(evaluate_v2(&c, &s, &st, now).is_empty(), "冷却期内不得抖动");
+        }
+        // 冷却结束且全部回落 → 恢复
+        now += Duration::from_secs(30);
+        let d = evaluate_v2(&c, &snap(20.0, Some(1.0), None, Some(65.0)), &st, now);
+        assert_eq!(d.len(), 1);
+        assert!(matches!(d[0].action, Action::Restore { .. }));
+    }
+
+    #[test]
+    fn recommend_mode_returns_decisions_without_state_mutation() {
+        let st = State::default();
+        let mut c = cfg_auto();
+        c.mode = Mode::Recommend;
+        let d = recommend(&c, &snap(95.0, Some(45.0), None, Some(85.0)), &st, Instant::now());
+        assert_eq!(d.len(), 1);
+        assert!(!st.engaged, "recommend 不改状态");
+        assert!(!d[0].reasons.is_empty(), "决策必须可解释");
     }
 }

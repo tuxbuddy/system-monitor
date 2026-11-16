@@ -41,6 +41,8 @@ pub struct Server {
     caller: String,
     /// 统一命令执行器（#12）：写操作全部经它（策略+审计+错误归一）。
     dispatcher: CommandDispatcher,
+    /// 诊断会话仓库（#25）。
+    diag_store: std::sync::Arc<std::sync::Mutex<crate::diagnose::SessionStore>>,
     sampler: Sampler,
     last_local: Instant,
     remote_prev: HashMap<String, Option<remote::Counters>>,
@@ -55,6 +57,7 @@ impl Server {
             policy: PolicyMode::Readonly,
             caller: std::env::var("SM_MCP_CALLER").unwrap_or_else(|_| "stdio".to_string()),
             dispatcher: CommandDispatcher::new(PolicyMode::Readonly, "mcp"),
+            diag_store: std::sync::Arc::new(std::sync::Mutex::new(crate::diagnose::SessionStore::default())),
             remote_fresh: HashMap::new(),
             sampler: Sampler::new(),
             last_local: Instant::now() - Duration::from_secs(10),
@@ -390,6 +393,111 @@ impl Server {
                     "oom_score": d.oom_score, "oom_score_adj": d.oom_score_adj,
                 }))
             }
+            "ebpf_doctor" => {
+                // eBPF 实验能力矩阵（#27）:不支持时明确列出原因
+                let cap = monitor_linux::ebpf::detect();
+                let mut v = cap.to_json();
+                v["limits"] = monitor_linux::ebpf::ResourceLimits::from_env().to_json();
+                v["experiments"] = monitor_linux::ebpf::experiments_json();
+                Ok(v)
+            }
+            // ---- 诊断会话（#25）----
+            "diag_start" => {
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.create();
+                Ok(json!({"session": sess.id, "phase": sess.phase.as_str()}))
+            }
+            "diag_add_evidence" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("manual");
+                let fact = args.get("fact").and_then(|v| v.as_str()).ok_or("缺少 fact")?;
+                let hypothesis = args.get("hypothesis").and_then(|v| v.as_str());
+                let conf = match args.get("confidence").and_then(|v| v.as_str()).unwrap_or("high") {
+                    "low" => crate::diagnose::Confidence::Low,
+                    "medium" => crate::diagnose::Confidence::Medium,
+                    _ => crate::diagnose::Confidence::High,
+                };
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                let ev = sess.add_evidence(source, fact, hypothesis, conf);
+                Ok(json!({"session": id, "evidence_id": ev.id, "phase": sess.phase.as_str()}))
+            }
+            "diag_submit_plan" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let description = args.get("description").and_then(|v| v.as_str()).ok_or("缺少 description")?;
+                let command = args.get("command").cloned().ok_or("缺少 command(经 dispatcher 执行的命令 JSON)")?;
+                let rollback = args.get("rollback").and_then(|v| v.as_str()).unwrap_or("");
+                let verify = args.get("verify_metric").and_then(|v| v.as_str()).unwrap_or("");
+                let risk = derive_risk(&command)?;
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                let h = sess.submit_plan(description, command, risk, rollback, verify);
+                Ok(json!({"session": id, "plan_hash": format!("{h:016x}"), "risk": risk.as_str(), "phase": sess.phase.as_str()}))
+            }
+            "diag_approve" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let hash_raw = args.get("plan_hash").and_then(|v| v.as_str()).ok_or("缺少 plan_hash")?;
+                let h = u64::from_str_radix(hash_raw, 16).map_err(|_| "plan_hash 需为 16 进制")?;
+                let token = args.get("approval_token").and_then(|v| v.as_str()).map(String::from);
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                let token_result = sess
+                    .plans
+                    .get(&h)
+                    .map(|plan| {
+                        if plan.risk >= monitor_core::mcppolicy::RiskLevel::L3 {
+                            match &token {
+                                Some(t) => monitor_core::mcppolicy::consume_approval(
+                                    "diag_execute",
+                                    &json!({"session": id, "plan": plan.command_json}),
+                                    t,
+                                )
+                                .map(|_| ()),
+                                None => Err("L3 需要 approval_token(mcp-approve --tool diag_execute)".to_string()),
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_or_else(|| Err("计划不存在".to_string()));
+                sess.approve(h, true, token_result).map_err(|e| e.to_string())?;
+                Ok(json!({"session": id, "plan_hash": hash_raw, "approved": true, "phase": sess.phase.as_str()}))
+            }
+            "diag_execute" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let hash_raw = args.get("plan_hash").and_then(|v| v.as_str()).ok_or("缺少 plan_hash")?;
+                let h = u64::from_str_radix(hash_raw, 16).map_err(|_| "plan_hash 需为 16 进制")?;
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                sess.can_execute(h).map_err(|e| e.to_string())?;
+                let cmd = sess.plans.get(&h).ok_or("计划不存在")?.command_json.clone();
+                let command = command_from_json(&cmd)?;
+                let result = self.dispatcher.run(&command);
+                let (ok, msg) = match result {
+                    Ok(m) => (true, m),
+                    Err(e) => (false, e.to_string()),
+                };
+                sess.record_execution(h, ok, &msg).map_err(|e| e.to_string())?;
+                Ok(json!({"session": id, "ok": ok, "message": msg, "phase": sess.phase.as_str()}))
+            }
+            "diag_verify" => {
+                let id = args.get("session").and_then(|v| v.as_str()).ok_or("缺少 session")?;
+                let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                let sess = store.get_mut(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                sess.verify(&note);
+                Ok(json!({"session": id, "phase": sess.phase.as_str(), "report": sess.to_json()}))
+            }
+            "diag_status" => {
+                let store = self.diag_store.lock().map_err(|e| e.to_string())?;
+                match args.get("session").and_then(|v| v.as_str()) {
+                    Some(id) => {
+                        let sess = store.get(id).ok_or_else(|| format!("会话 {id} 不存在"))?;
+                        Ok(sess.to_json())
+                    }
+                    None => Ok(json!({"sessions": store.ids()})),
+                }
+            }
             "psi_status" => {
                 let snap = monitor_core::psi::read_local();
                 // cgroup v2 委派根下的 *.pressure 作为补充源(本地 /proc/pressure 缺失时尤其有用)
@@ -648,6 +756,35 @@ impl Server {
     }
 }
 
+/// 方案命令 JSON → Command（dispatcher 执行）。
+fn command_from_json(v: &Value) -> Result<crate::service::Command, String> {
+    use crate::service::Command as C;
+    let kind = v.get("kind").and_then(|k| k.as_str()).ok_or("command 缺少 kind")?;
+    match kind {
+        "cg_set" => {
+            let group = v.get("group").and_then(|g| g.as_str()).ok_or("cg_set 缺少 group")?;
+            let pct = v.get("pct").and_then(|p| p.as_u64()).map(|p| p as u32);
+            Ok(C::CgSetLocal { group: group.to_string(), pct })
+        }
+        "signal" => {
+            let pid = v.get("pid").and_then(|p| p.as_i64()).ok_or("signal 缺少 pid")? as i32;
+            let sig = v.get("sig").and_then(|s| s.as_i64()).ok_or("signal 缺少 sig")? as i32;
+            Ok(C::SignalLocal { pid, sig })
+        }
+        "nice" => {
+            let pid = v.get("pid").and_then(|p| p.as_i64()).ok_or("nice 缺少 pid")? as i32;
+            let nice = v.get("nice").and_then(|n| n.as_i64()).ok_or("nice 缺少 nice")? as i32;
+            Ok(C::NiceLocal { pid, nice })
+        }
+        other => Err(format!("未知命令 kind：{other}")),
+    }
+}
+
+/// 由命令内容推导风险(与 dispatcher/分级表同源)。
+fn derive_risk(v: &Value) -> Result<monitor_core::mcppolicy::RiskLevel, String> {
+    Ok(command_from_json(v)?.risk())
+}
+
 fn local_os() -> String {
     std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -851,6 +988,70 @@ fn tools() -> Vec<Value> {
             "本地进程详情：uid/gid/线程数/内存、I/O 字节(read/write 与 rchar/wchar)、FD 数量与上限、OOM 评分。",
             json!({"pid": {"type": "integer"}}),
             &["pid"],
+        ),
+        tool(
+            "ebpf_doctor",
+            "eBPF 实验能力矩阵:内核版本/BTF/bpf(2)/perf/tracefs 逐项检查,不满足时列出原因;附三个首批场景的实验定义与资源上限。",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "diag_start",
+            "开始一次诊断会话:后续证据/方案/审批/执行/验证都引用返回的 session id。",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "diag_add_evidence",
+            "向会话追加证据(事实/推断/置信度)。",
+            json!({
+                "session": {"type": "string"},
+                "source": {"type": "string"},
+                "fact": {"type": "string"},
+                "hypothesis": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            }),
+            &["session", "fact"],
+        ),
+        tool(
+            "diag_submit_plan",
+            "提交动作方案:命令 JSON(kind=cg_set|signal|nice,经统一 dispatcher 执行)、回滚步骤、预期验证指标。返回 plan_hash。",
+            json!({
+                "session": {"type": "string"},
+                "description": {"type": "string"},
+                "command": {"type": "object"},
+                "rollback": {"type": "string"},
+                "verify_metric": {"type": "string"},
+            }),
+            &["session", "description", "command"],
+        ),
+        tool(
+            "diag_approve",
+            "审批方案;L3(KILL/树/删除)需 approval_token(mcp-approve --tool diag_execute)。计划变更后旧审批失效。",
+            json!({
+                "session": {"type": "string"},
+                "plan_hash": {"type": "string"},
+                "approval_token": {"type": "string"},
+            }),
+            &["session", "plan_hash"],
+        ),
+        tool(
+            "diag_execute",
+            "执行已审批的方案(经统一 dispatcher:策略+审计)。执行后进入 verifying。",
+            json!({"session": {"type": "string"}, "plan_hash": {"type": "string"}}),
+            &["session", "plan_hash"],
+        ),
+        tool(
+            "diag_verify",
+            "复采验证并归档会话(可回放/导出)。",
+            json!({"session": {"type": "string"}, "note": {"type": "string"}}),
+            &["session"],
+        ),
+        tool(
+            "diag_status",
+            "查看会话状态/报告(含证据链与审计要素)。",
+            json!({"session": {"type": "string"}}),
+            &[],
         ),
         tool(
             "psi_status",
@@ -1164,6 +1365,87 @@ mod tests {
         assert_eq!(find("system_overview")["annotations"]["readOnlyHint"], true);
         assert_eq!(find("process_nice")["annotations"]["readOnlyHint"], false);
         assert!(find("policy_status")["name"] == "policy_status");
+    }
+
+    #[test]
+    fn diag_session_end_to_end_demo() {
+        // 「高 CPU」端到端:证据→方案→审批→执行→验证(MVP 演示,无真实执行)
+        let mut s = Server::new();
+        s.policy = PolicyMode::Trusted; // 演示放行执行;readonly 下 diag_execute 会被策略拦
+        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diag_start","arguments":{}}}"#);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        let sid = v["session"].as_str().unwrap().to_string();
+
+        for (fact, hyp) in [("cpu 95%", "ffmpeg 占满"), ("psi.cpu.some avg10=45", "真实争用")] {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"diag_add_evidence","arguments":{{"session":"{sid}","source":"proc","fact":"{fact}","hypothesis":"{hyp}"}}}}}}"#
+            );
+            let r = call(&mut s, &line);
+            assert_eq!(r["result"]["isError"], false);
+        }
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"diag_submit_plan","arguments":{{"session":"{sid}","description":"限流 media 分组","command":{{"kind":"cg_set","group":"media","pct":50}},"rollback":"恢复 max","verify_metric":"psi<20"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        let hash = v["plan_hash"].as_str().unwrap().to_string();
+
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"diag_approve","arguments":{{"session":"{sid}","plan_hash":"{hash}"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        assert_eq!(r["result"]["isError"], false);
+
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"diag_execute","arguments":{{"session":"{sid}","plan_hash":"{hash}"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        // cg_set 本机无 cgroup 环境会执行失败,但流程状态机必须推进到 verifying
+        assert_eq!(v["phase"], "verifying", "{v}");
+
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"diag_verify","arguments":{{"session":"{sid}","note":"psi 回落"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["phase"], "done");
+        assert!(v["report"]["evidences"].as_array().unwrap().len() >= 2, "证据链可回放");
+    }
+
+    #[test]
+    fn diag_execute_denied_in_readonly() {
+        let mut s = Server::new(); // readonly
+        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diag_start","arguments":{}}}"#);
+        let sid: String = {
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            let v: Value = serde_json::from_str(text).unwrap();
+            v["session"].as_str().unwrap().to_string()
+        };
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"diag_submit_plan","arguments":{{"session":"{sid}","description":"x","command":{{"kind":"signal","pid":4242,"sig":15}}}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        let hash: String = {
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            let v: Value = serde_json::from_str(text).unwrap();
+            v["plan_hash"].as_str().unwrap().to_string()
+        };
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"diag_approve","arguments":{{"session":"{sid}","plan_hash":"{hash}"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        assert_eq!(r["result"]["isError"], false);
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"diag_execute","arguments":{{"session":"{sid}","plan_hash":"{hash}"}}}}}}"#
+        );
+        let r = call(&mut s, &line);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("策略拒绝"), "readonly 下 diag_execute 必须被策略拦截：{text}");
     }
 
     #[test]

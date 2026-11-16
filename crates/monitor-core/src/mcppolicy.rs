@@ -105,6 +105,11 @@ fn base_risk(tool: &str) -> RiskLevel {
         "process_nice" | "scheduler_set_limit" | "probe_attach" | "probe_detach" => RiskLevel::L2,
         // L3 / 参数敏感
         "process_signal" | "scheduler_group_action" => RiskLevel::L2, // 具体看 risk_of
+        // 诊断会话簿记工具(真正的动作执行经 dispatcher 单独裁决)
+        "ebpf_doctor" | "diag_start" | "diag_add_evidence" | "diag_submit_plan" | "diag_approve" | "diag_status" => RiskLevel::L1,
+        // diag_execute 的实际风险由其 plan 命令决定(经 dispatcher 裁决);簿记层 L1
+        "diag_execute" => RiskLevel::L1,
+        "diag_verify" => RiskLevel::L1,
         // 元工具
         "policy_status" => RiskLevel::L0,
         other => {
@@ -501,7 +506,10 @@ mod tests {
         let a = args(4242, "KILL", false);
         let ap = issue_approval("process_signal", &a, 60).expect("签发");
         // 匹配参数:允许;并立即消费
-        assert!(consume_approval("process_signal", &a, &ap.token).is_ok(), "正确凭证应通过");
+        if let Err(e) = consume_approval("process_signal", &a, &ap.token) {
+            let secret = load_or_create_secret().map(|s| s.len()).unwrap_or(0);
+            panic!("正确凭证应通过：{e}；secret_len={secret}; home={:?}", std::env::var("SM_HOME").unwrap_or_default());
+        }
         // 复用拒绝
         let err = consume_approval("process_signal", &a, &ap.token).unwrap_err();
         assert!(err.contains("已使用"), "{err}");

@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod caps;
 pub mod cgroup;
+pub mod ebpf;
 pub mod pi;
 pub mod platform;
 pub mod probe;
