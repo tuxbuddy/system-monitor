@@ -24,8 +24,8 @@ struct View {
 }
 
 pub struct Server {
-    current: Option<String>,
-    hosts: Vec<String>,
+    current: Option<remote::SshTarget>,
+    hosts: Vec<remote::SshTarget>,
     sampler: Sampler,
     last_local: Instant,
     remote_prev: HashMap<String, Option<remote::Counters>>,
@@ -36,7 +36,7 @@ impl Server {
     fn new() -> Self {
         let mut s = Self {
             current: None,
-            hosts: remote::load_hosts(),
+            hosts: remote::load_hosts().0,
             sampler: Sampler::new(),
             last_local: Instant::now() - Duration::from_secs(10),
             remote_prev: HashMap::new(),
@@ -48,15 +48,18 @@ impl Server {
         s
     }
 
-    fn target(&self, args: &Value) -> Option<String> {
+    /// 解析工具参数里的目标主机：非法目标直接报错，绝不进入 ssh 命令行。
+    fn target(&self, args: &Value) -> Result<Option<remote::SshTarget>, String> {
         match args.get("host").and_then(|v| v.as_str()) {
-            Some(h) if !h.is_empty() && h != "local" => Some(h.to_string()),
-            Some(_) => None,
-            None => self.current.clone(),
+            Some(h) if !h.is_empty() && h != "local" => {
+                remote::SshTarget::parse(h).map(Some).map_err(|e| format!("host 参数非法：{e}"))
+            }
+            Some(_) => Ok(None),
+            None => Ok(self.current.clone()),
         }
     }
 
-    fn view(&mut self, host: &Option<String>) -> Result<View, String> {
+    fn view(&mut self, host: &Option<remote::SshTarget>) -> Result<View, String> {
         match host {
             None => {
                 let mut usage = self.sampler.sample();
@@ -75,22 +78,23 @@ impl Server {
                 })
             }
             Some(h) => {
-                let mut prev = self.remote_prev.remove(h).flatten();
+                let key = h.as_str().to_string();
+                let mut prev = self.remote_prev.remove(&key).flatten();
                 let first = prev.is_none();
-                let mut sample = remote::collect(h, &mut prev).ok_or_else(|| format!("无法连接远端主机：{h}"))?;
+                let mut sample = remote::collect(h, &mut prev).ok_or_else(|| format!("无法连接远端主机：{key}"))?;
                 if first {
                     std::thread::sleep(Duration::from_millis(120));
                     if let Some(again) = remote::collect(h, &mut prev) {
                         sample = again;
                     }
                 }
-                self.remote_prev.insert(h.clone(), prev);
+                self.remote_prev.insert(key, prev);
                 Ok(View {
                     usage: sample.usage,
                     pi: sample.pi,
                     filesystems: sample.filesystems,
                     conns: sample.conns,
-                    label: h.clone(),
+                    label: h.as_str().to_string(),
                 })
             }
         }
@@ -106,21 +110,26 @@ impl Server {
 
     fn call(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
-            "hosts_list" => Ok(json!({
-                "current": self.current.clone().unwrap_or_else(|| "local".to_string()),
-                "hosts": self.hosts.clone(),
-            })),
+            "hosts_list" => {
+                let (saved, errs) = remote::load_hosts();
+                Ok(json!({
+                    "current": self.current.as_ref().map(|t| t.as_str()).unwrap_or("local"),
+                    "hosts": saved.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                    "invalid_lines": errs.iter().map(|e| json!({"line": e.line_no, "target": e.target, "error": e.error.to_string()})).collect::<Vec<_>>(),
+                }))
+            }
             "host_use" => {
                 let h = args.get("host").and_then(|v| v.as_str()).unwrap_or("local").trim().to_string();
                 if h.is_empty() || h == "local" {
                     self.current = None;
                     return Ok(json!({"current": "local", "os": local_os()}));
                 }
+                let target = remote::SshTarget::parse(&h).map_err(|e| format!("host 参数非法：{e}"))?;
                 let mut prev = None;
-                let sample = remote::collect(&h, &mut prev).ok_or_else(|| format!("无法连接主机：{h}"))?;
-                self.current = Some(h.clone());
-                if !self.hosts.iter().any(|x| x == &h) {
-                    self.hosts.push(h.clone());
+                let sample = remote::collect(&target, &mut prev).ok_or_else(|| format!("无法连接主机：{h}"))?;
+                self.current = Some(target.clone());
+                if !self.hosts.iter().any(|x| x == &target) {
+                    self.hosts.push(target.clone());
                 }
                 Ok(json!({
                     "current": h,
@@ -129,12 +138,12 @@ impl Server {
                 }))
             }
             "system_overview" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let v = self.view(&host)?;
                 Ok(overview_json(&v))
             }
             "system_load" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let v = self.view(&host)?;
                 Ok(json!({
                     "host": v.label,
@@ -145,7 +154,7 @@ impl Server {
                 }))
             }
             "process_list" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let v = self.view(&host)?;
                 let sort = args.get("sort").and_then(|x| x.as_str()).unwrap_or("cpu");
                 let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(25).clamp(1, 500) as usize;
@@ -188,7 +197,7 @@ impl Server {
                 }
                 let sig = args.get("signal").and_then(|v| v.as_str()).unwrap_or("TERM").to_uppercase();
                 let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let num = signal_number(&sig)?;
                 if tree && num != 9 && num != 15 {
                     return Err("tree=true 仅支持 TERM / KILL".to_string());
@@ -219,7 +228,7 @@ impl Server {
                 };
                 let count = if n > 0 { n } else { ok };
                 Ok(json!({
-                    "host": host.unwrap_or_else(|| "local".to_string()),
+                    "host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"),
                     "pid": pid, "signal": sig, "tree": tree, "signalled": count,
                 }))
             }
@@ -229,15 +238,15 @@ impl Server {
                     return Err("拒绝操作 PID ≤ 1".to_string());
                 }
                 let nice = args.get("nice").and_then(|v| v.as_i64()).ok_or("缺少 nice")?.clamp(-20, 19) as i32;
-                let host = self.target(args);
+                let host = self.target(args)?;
                 match &host {
                     None => crate::actions::set_nice(pid, nice).map_err(|e| e.to_string())?,
                     Some(h) => remote::set_nice(h, pid, nice)?,
                 }
-                Ok(json!({"host": host.unwrap_or_else(|| "local".to_string()), "pid": pid, "nice": nice}))
+                Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "pid": pid, "nice": nice}))
             }
             "scheduler_groups" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 match &host {
                     None => {
                         let mgr = crate::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
@@ -247,12 +256,12 @@ impl Server {
                     Some(h) => {
                         let base = remote::cg_base(h).ok_or_else(|| "该主机没有可写的用户 cgroup 委派根".to_string())?;
                         let groups = remote::cg_list(h, &base);
-                        Ok(json!({"host": h, "base": base, "groups": groups_json(&groups)}))
+                        Ok(json!({"host": h.as_str(), "base": base, "groups": groups_json(&groups)}))
                     }
                 }
             }
             "scheduler_set_limit" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let group = args.get("group").and_then(|v| v.as_str()).ok_or("缺少 group")?.to_string();
                 if !crate::cgroup::valid_group_name(&group) {
                     return Err("group 名称非法".to_string());
@@ -300,13 +309,13 @@ impl Server {
                     }
                 }
                 Ok(json!({
-                    "host": host.unwrap_or_else(|| "local".to_string()),
+                    "host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"),
                     "group": group, "cpu_max_pct": pct, "cpu_weight": weight,
                     "pids_max": pids.flatten(),
                 }))
             }
             "scheduler_group_action" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let action = args.get("action").and_then(|v| v.as_str()).ok_or("缺少 action（create/delete）")?;
                 let name = args.get("name").and_then(|v| v.as_str()).ok_or("缺少 name")?.to_string();
                 if !crate::cgroup::valid_group_name(&name) {
@@ -333,10 +342,10 @@ impl Server {
                         }
                     }
                 }
-                Ok(json!({"host": host.unwrap_or_else(|| "local".to_string()), "action": action, "name": name}))
+                Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "action": action, "name": name}))
             }
             "network_connections" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let v = self.view(&host)?;
                 let proto = args.get("proto").and_then(|x| x.as_str()).map(|s| s.to_uppercase());
                 let state = args.get("state").and_then(|x| x.as_str()).map(|s| s.to_uppercase());
@@ -359,7 +368,7 @@ impl Server {
                 }))
             }
             "filesystems" => {
-                let host = self.target(args);
+                let host = self.target(args)?;
                 let v = self.view(&host)?;
                 Ok(json!({
                     "host": v.label,

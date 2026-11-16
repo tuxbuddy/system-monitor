@@ -5,12 +5,235 @@
 //! 前提：本机到目标已配置免密登录（SSH key / agent）；命令一律只读。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::fsutil;
 use crate::pi::{self, GpuStats, PiStats, Power, RemoteInfo};
 use crate::procstats::{self, CpuTimes, FsUsage, NetConn, ProcDetails, ProcUsage, Usage};
+pub use crate::sshtarget::{HostsLineError, SshTarget, parse_hosts_checked};
+
+// ---- SSH 执行层：统一 deadline / 输出上限 / 取消 ----
+
+/// 单次远端命令的限制。默认总超时 10s、输出 2 MiB。
+#[derive(Clone, Copy)]
+pub struct ExecLimits {
+    pub timeout: Duration,
+    pub max_output: usize,
+}
+
+impl Default for ExecLimits {
+    fn default() -> Self {
+        Self { timeout: Duration::from_secs(10), max_output: 2 * 1024 * 1024 }
+    }
+}
+
+/// 协作式取消标志：主机切换、退出、fleet 刷新时置位，在途命令尽快返回。
+#[derive(Default)]
+pub struct Cancel {
+    flag: AtomicBool,
+}
+
+impl Cancel {
+    /// GUI/MCP 侧创建共享取消句柄（后续波次接线主机切换/退出取消；测试覆盖取消路径）。
+    #[allow(dead_code)]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    /// 触发协作式取消：所有持有该句柄的在途命令尽快返回。
+    #[allow(dead_code)]
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+    fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+/// 远端失败的结构化错误：区分阶段，带耗时，不再以裸字符串兜底。
+#[derive(Debug, Clone)]
+pub enum RemoteError {
+    /// ssh 无法启动（本机没有 ssh、资源不足等）。
+    Spawn(String),
+    /// 超过总超时，子进程已被 kill 并回收。
+    Timeout { elapsed: Duration },
+    /// 调用方主动取消，子进程已被 kill 并回收。
+    Cancelled { elapsed: Duration },
+    /// ssh 退出码非 0（认证失败、网络不可达、远端命令失败）。
+    Failed { code: i32, stderr: String },
+}
+
+impl RemoteError {
+    /// 机器可读的错误码，供 UI/MCP 展示与分类（测试与后续结构化错误通道使用）。
+    #[allow(dead_code)]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Spawn(_) => "spawn",
+            Self::Timeout { .. } => "timeout",
+            Self::Cancelled { .. } => "cancelled",
+            Self::Failed { code, stderr } => {
+                if stderr.contains("Permission denied") || stderr.contains("Authentication failed") {
+                    "auth"
+                } else if *code == 255 {
+                    "unreachable"
+                } else {
+                    "command"
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "无法启动 ssh：{e}"),
+            Self::Timeout { elapsed } => write!(f, "远端命令超时（{:.1}s），已终止", elapsed.as_secs_f32()),
+            Self::Cancelled { elapsed } => write!(f, "远端命令已取消（{:.1}s）", elapsed.as_secs_f32()),
+            Self::Failed { code, stderr } => {
+                let msg = stderr.trim();
+                if msg.is_empty() {
+                    write!(f, "远端命令失败（退出码 {code}）")
+                } else {
+                    write!(f, "远端命令失败：{}", truncate_tail(msg, 300))
+                }
+            }
+        }
+    }
+}
+
+fn truncate_tail(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecOutput {
+    pub stdout: String,
+    /// 保留诊断信息：失败分类（auth/unreachable）依赖它
+    #[allow(dead_code)]
+    pub stderr: String,
+    /// 输出超过上限被截断（数据不完整，调用方需感知）。
+    pub truncated: bool,
+}
+
+/// 统一的 SSH 执行入口：所有远端命令都必须经过这里。
+///
+/// 保证：在 `timeout + 1s` 内返回；超时/取消后 kill 并回收 ssh，不留孤儿进程；
+/// stdout/stderr 各自最多读 `max_output` 字节，超限置 `truncated` 并终止命令。
+pub fn ssh_exec(
+    target: &SshTarget,
+    script: &str,
+    limits: &ExecLimits,
+    cancel: Option<&Cancel>,
+) -> Result<ExecOutput, RemoteError> {
+    let started = Instant::now();
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=6",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "--", // 终止选项解析：目标串即使形如选项也不会被 ssh 误读
+    ])
+    .arg(target.as_str())
+    .arg(script)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child: Child = cmd.spawn().map_err(|e| RemoteError::Spawn(e.to_string()))?;
+
+    // 读线程：各限 max_output 字节；读满即标记截断，主循环会终止命令。
+    let truncated = Arc::new(AtomicBool::new(false));
+    let out_handle = spawn_reader(child.stdout.take(), limits.max_output, truncated.clone());
+    let err_handle = spawn_reader(child.stderr.take(), limits.max_output, truncated.clone());
+
+    let outcome = loop {
+        if let Some(c) = cancel
+            && c.cancelled()
+        {
+            break Err(RemoteError::Cancelled { elapsed: started.elapsed() });
+        }
+        if truncated.load(Ordering::Relaxed) {
+            break Err(RemoteError::Failed { code: -1, stderr: format!("输出超过 {} 字节上限，命令已终止", limits.max_output) });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(RemoteError::Spawn(e.to_string())),
+        }
+        if started.elapsed() >= limits.timeout {
+            break Err(RemoteError::Timeout { elapsed: started.elapsed() });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    if outcome.is_err() {
+        // 超时 / 取消 / 截断：kill 进程并同步回收，读线程随管道 EOF 退出
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    let truncated = truncated.load(Ordering::Relaxed);
+
+    match outcome {
+        Err(e) => Err(e),
+        Ok(status) => {
+            if status.success() {
+                Ok(ExecOutput {
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    truncated,
+                })
+            } else {
+                Err(RemoteError::Failed { code: status.code().unwrap_or(-1), stderr: String::from_utf8_lossy(&stderr).into_owned() })
+            }
+        }
+    }
+}
+
+fn spawn_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    cap: usize,
+    truncated: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let Some(mut pipe) = pipe else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() + n > cap {
+                        let room = cap.saturating_sub(buf.len());
+                        buf.extend_from_slice(&chunk[..room]);
+                        truncated.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    })
+}
 
 /// 远端只读采集脚本（单次 SSH 一次拿全）。
 /// 跨发行版：传感器优先 hwmon（coretemp/k10temp 等），功耗优先 RAPL 能量差分，
@@ -51,28 +274,25 @@ pub fn hosts_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/system-monitor/hosts.conf"))
 }
 
-pub fn parse_hosts(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|s| s.to_string())
-        .collect()
-}
-
-pub fn load_hosts() -> Vec<String> {
+/// 读取 hosts.conf：合法目标 + 带行号的非法行报告（不静默跳过）。
+pub fn load_hosts() -> (Vec<SshTarget>, Vec<HostsLineError>) {
     hosts_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| parse_hosts(&t))
+        .map(|t| parse_hosts_checked(&t))
         .unwrap_or_default()
 }
 
-pub fn save_hosts(hosts: &[String]) {
-    if let Some(p) = hosts_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(p, hosts.join("\n") + "\n");
+/// 原子写入主机清单（0600）。所有条目先经校验；返回首个非法项的错误。
+pub fn save_hosts(hosts: &[SshTarget]) -> Result<(), String> {
+    let Some(p) = hosts_path() else {
+        return Ok(());
+    };
+    let mut text = String::new();
+    for h in hosts {
+        text.push_str(h.as_str());
+        text.push('\n');
     }
+    fsutil::atomic_write(&p, text.as_bytes(), fsutil::MODE_PRIVATE).map_err(|e| format!("hosts.conf 写入失败：{e}"))
 }
 
 fn sections(text: &str) -> HashMap<String, String> {
@@ -291,19 +511,13 @@ pub fn parse_output(text: &str, prev: &mut Option<Counters>) -> Option<RemoteSam
     Some(RemoteSample { usage, pi, filesystems, conns })
 }
 
-/// 通过 SSH 拉取一次（只读）。target 形如 user@host 或 ~/.ssh/config 里的别名。
-pub fn collect(target: &str, prev: &mut Option<Counters>) -> Option<RemoteSample> {
-    let out = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=6"])
-        .arg(target)
-        .arg(SCRIPT)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// 通过 SSH 拉取一次（只读）。target 必须是已校验的 `SshTarget`。
+pub fn collect(target: &SshTarget, prev: &mut Option<Counters>) -> Option<RemoteSample> {
+    let out = ssh_exec(target, SCRIPT, &ExecLimits::default(), None).ok()?;
+    if out.truncated {
+        return None; // 输出不完整，宁可不更新也不能拿半截数据冒充采样
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_output(&text, prev)
+    parse_output(&out.stdout, prev)
 }
 
 /// 单主机摘要（供总览页并排展示）。
@@ -319,7 +533,7 @@ pub struct FleetSummary {
     pub procs: usize,
 }
 
-pub fn summary(target: &str, prev: &mut Option<Counters>) -> FleetSummary {
+pub fn summary(target: &SshTarget, prev: &mut Option<Counters>) -> FleetSummary {
     match collect(target, prev) {
         Some(s) => FleetSummary {
             ok: true,
@@ -353,34 +567,22 @@ pub fn summary(target: &str, prev: &mut Option<Counters>) -> FleetSummary {
 
 use crate::cgroup::{self, GroupState};
 
-fn ssh_sh(target: &str, script: &str) -> Option<String> {
-    let out = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=6"])
-        .arg(target)
-        .arg(script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn ssh_sh(target: &SshTarget, script: &str) -> Option<String> {
+    let out = ssh_exec(target, script, &ExecLimits::default(), None).ok()?;
+    if out.truncated {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some(out.stdout)
 }
 
 // ---- 远端进程操作（对应本地 actions.rs；只接受数字 PID 与固定命令模板）----
 
-fn ssh_run(target: &str, cmd: &str) -> Result<String, String> {
-    let out = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=6"])
-        .arg(target)
-        .arg(cmd)
-        .output()
-        .map_err(|e| format!("无法连接主机：{e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if err.is_empty() { format!("远端命令失败（{}）", out.status) } else { err })
+fn ssh_run(target: &SshTarget, cmd: &str) -> Result<String, String> {
+    let out = ssh_exec(target, cmd, &ExecLimits::default(), None).map_err(|e| e.to_string())?;
+    if out.truncated {
+        return Err("远端输出超过上限（可能异常）".to_string());
     }
+    Ok(out.stdout)
 }
 
 fn valid_pid(pid: i32) -> bool {
@@ -388,7 +590,7 @@ fn valid_pid(pid: i32) -> bool {
 }
 
 /// 向远端单个进程发信号（sig 为信号编号，如 15/9/18/19）。
-pub fn signal(target: &str, pid: i32, sig: i32) -> Result<(), String> {
+pub fn signal(target: &SshTarget, pid: i32, sig: i32) -> Result<(), String> {
     if !valid_pid(pid) {
         return Err("PID 无效".to_string());
     }
@@ -396,7 +598,7 @@ pub fn signal(target: &str, pid: i32, sig: i32) -> Result<(), String> {
 }
 
 /// 向远端一组进程发信号，返回成功个数（用于结束进程树）。
-pub fn signal_many(target: &str, pids: &[i32], sig: i32) -> Result<usize, String> {
+pub fn signal_many(target: &SshTarget, pids: &[i32], sig: i32) -> Result<usize, String> {
     let list: Vec<String> = pids.iter().copied().filter(|p| valid_pid(*p)).map(|p| p.to_string()).collect();
     if list.is_empty() {
         return Err("PID 无效".to_string());
@@ -405,14 +607,14 @@ pub fn signal_many(target: &str, pids: &[i32], sig: i32) -> Result<usize, String
     ssh_run(target, &script)?.trim().parse::<usize>().map_err(|_| "远端返回异常".to_string())
 }
 
-pub fn set_nice(target: &str, pid: i32, nice: i32) -> Result<(), String> {
+pub fn set_nice(target: &SshTarget, pid: i32, nice: i32) -> Result<(), String> {
     if !valid_pid(pid) {
         return Err("PID 无效".to_string());
     }
     ssh_run(target, &format!("renice -n {} -p {pid}", nice.clamp(-20, 19))).map(|_| ())
 }
 
-pub fn read_cmdline(target: &str, pid: i32) -> Option<String> {
+pub fn read_cmdline(target: &SshTarget, pid: i32) -> Option<String> {
     if !valid_pid(pid) {
         return None;
     }
@@ -421,7 +623,7 @@ pub fn read_cmdline(target: &str, pid: i32) -> Option<String> {
 }
 
 /// 远端进程详情（status / cmdline / exe / cwd / io 一次拉取）。
-pub fn read_details(target: &str, pid: i32) -> Option<ProcDetails> {
+pub fn read_details(target: &SshTarget, pid: i32) -> Option<ProcDetails> {
     if !valid_pid(pid) {
         return None;
     }
@@ -459,7 +661,7 @@ pub fn user_service_path(uid: u32) -> String {
 
 /// 远端可写的委派根。注意：SSH 会话本身在 `session-*.scope`，并不在 `user@uid.service`
 /// 内，所以必须按 SSH 用户的 uid 推算 user@uid.service 并校验存在且可写。
-pub fn cg_base(target: &str) -> Option<String> {
+pub fn cg_base(target: &SshTarget) -> Option<String> {
     let uid: u32 = ssh_sh(target, "id -u")?.trim().parse().ok()?;
     let base = user_service_path(uid);
     let ok = ssh_sh(target, &format!("[ -d '{base}' ] && [ -w '{base}' ] && echo OK"))
@@ -469,7 +671,7 @@ pub fn cg_base(target: &str) -> Option<String> {
 }
 
 /// 建并准备容器 cm-sched（+cpu +pids）。
-pub fn cg_ensure(target: &str, base: &str) -> bool {
+pub fn cg_ensure(target: &SshTarget, base: &str) -> bool {
     let c = format!("{base}/cm-sched");
     ssh_sh(
         target,
@@ -502,7 +704,7 @@ fn parse_group_lines(text: &str) -> Vec<GroupState> {
     out
 }
 
-pub fn cg_list(target: &str, base: &str) -> Vec<GroupState> {
+pub fn cg_list(target: &SshTarget, base: &str) -> Vec<GroupState> {
     let c = format!("{base}/cm-sched");
     let script = format!(
         "cd '{c}' 2>/dev/null || exit 0; for d in */; do [ -d \"$d\" ] || continue; n=${{d%/}}; [ \"$n\" = default ] && continue; \
@@ -515,15 +717,15 @@ fn safe_name(name: &str) -> bool {
     cgroup::valid_group_name(name)
 }
 
-pub fn cg_create(target: &str, base: &str, name: &str) -> bool {
+pub fn cg_create(target: &SshTarget, base: &str, name: &str) -> bool {
     safe_name(name) && ssh_sh(target, &format!("mkdir '{base}/cm-sched/{name}'")).is_some()
 }
 
-pub fn cg_delete(target: &str, base: &str, name: &str) -> bool {
+pub fn cg_delete(target: &SshTarget, base: &str, name: &str) -> bool {
     safe_name(name) && ssh_sh(target, &format!("rmdir '{base}/cm-sched/{name}'")).is_some()
 }
 
-pub fn cg_set_cpu_max(target: &str, base: &str, name: &str, pct: Option<u32>) -> bool {
+pub fn cg_set_cpu_max(target: &SshTarget, base: &str, name: &str, pct: Option<u32>) -> bool {
     if !safe_name(name) {
         return false;
     }
@@ -534,11 +736,11 @@ pub fn cg_set_cpu_max(target: &str, base: &str, name: &str, pct: Option<u32>) ->
     ssh_sh(target, &format!("printf '{val}' > '{base}/cm-sched/{name}/cpu.max'")).is_some()
 }
 
-pub fn cg_set_weight(target: &str, base: &str, name: &str, w: u32) -> bool {
+pub fn cg_set_weight(target: &SshTarget, base: &str, name: &str, w: u32) -> bool {
     safe_name(name) && ssh_sh(target, &format!("printf '{}' > '{base}/cm-sched/{name}/cpu.weight'", w.clamp(1, 10000))).is_some()
 }
 
-pub fn cg_set_pids(target: &str, base: &str, name: &str, max: Option<u32>) -> bool {
+pub fn cg_set_pids(target: &SshTarget, base: &str, name: &str, max: Option<u32>) -> bool {
     if !safe_name(name) {
         return false;
     }
@@ -547,7 +749,7 @@ pub fn cg_set_pids(target: &str, base: &str, name: &str, max: Option<u32>) -> bo
 }
 
 /// 迁入并返回原 cgroup 路径（形如 /user.slice/...），供还原。
-pub fn cg_move_in(target: &str, base: &str, name: &str, pid: i32) -> Option<String> {
+pub fn cg_move_in(target: &SshTarget, base: &str, name: &str, pid: i32) -> Option<String> {
     if !safe_name(name) {
         return None;
     }
@@ -558,7 +760,7 @@ pub fn cg_move_in(target: &str, base: &str, name: &str, pid: i32) -> Option<Stri
     ssh_sh(target, &script).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-pub fn cg_release(target: &str, original: &str, pid: i32) -> bool {
+pub fn cg_release(target: &SshTarget, original: &str, pid: i32) -> bool {
     if original.is_empty() || original.contains('\'') || original.contains(';') {
         return false;
     }
@@ -571,8 +773,74 @@ mod tests {
 
     #[test]
     fn hosts_parse() {
-        let v = parse_hosts("# 注释\n pi@192.168.1.5 \n\nroot@kylin\n");
-        assert_eq!(v, vec!["pi@192.168.1.5".to_string(), "root@kylin".to_string()]);
+        let (v, errs) = parse_hosts_checked("# 注释\n pi@192.168.1.5 \n\nroot@kylin\n");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].as_str(), "pi@192.168.1.5");
+        assert_eq!(v[1].as_str(), "root@kylin");
+        assert!(errs.is_empty(), "合法清单不应有错误：{errs:?}");
+        // 非法行必须报行号而不是被吞掉
+        let (_, errs) = parse_hosts_checked("ok-host\n-Injected\n");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].line_no, 2);
+    }
+
+    fn any_host() -> SshTarget {
+        SshTarget::parse("no-such-host.invalid").unwrap()
+    }
+
+    #[test]
+    fn remote_calls_have_deadline() {
+        // 不可达主机 + 短超时：必须在 deadline 附近返回结构化错误
+        let t = any_host();
+        let limits = ExecLimits { timeout: Duration::from_millis(700), max_output: 64 * 1024 };
+        let started = Instant::now();
+        let r = ssh_exec(&t, "echo hi", &limits, None);
+        let elapsed = started.elapsed();
+        match r {
+            Err(RemoteError::Timeout { .. }) | Err(RemoteError::Failed { .. }) => {}
+            other => panic!("应超时/失败，实际 {other:?}"),
+        }
+        assert!(elapsed < Duration::from_secs(3), "超时应在 deadline+缓冲内返回，实际 {elapsed:?}");
+    }
+
+    #[test]
+    fn ssh_exec_supports_cancel() {
+        // 用不可路由地址保证命令在连接阶段悬挂，100ms 后取消必然生效
+        let t = SshTarget::parse("user@10.255.255.1").unwrap();
+        let cancel = Cancel::new();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            c2.cancel();
+        });
+        let started = Instant::now();
+        let r = ssh_exec(&t, "echo hi", &ExecLimits { timeout: Duration::from_secs(30), max_output: 1024 }, Some(&cancel));
+        assert!(matches!(r, Err(RemoteError::Cancelled { .. })), "应可取消，实际 {r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "取消应及时返回");
+    }
+
+    #[test]
+    fn ssh_exec_output_is_capped() {
+        // 直接验证 reader 上限：读到 cap 即停并标记截断
+        let truncated = Arc::new(AtomicBool::new(false));
+        let h = spawn_reader(Some(std::io::Cursor::new(vec![b'y'; 1024])), 16, truncated.clone());
+        let buf = h.join().unwrap();
+        assert_eq!(buf.len(), 16);
+        assert!(truncated.load(Ordering::Relaxed));
+        // 小于上限的输入完整读取、不标记
+        let truncated = Arc::new(AtomicBool::new(false));
+        let h = spawn_reader(Some(std::io::Cursor::new(vec![b'y'; 8])), 16, truncated.clone());
+        assert_eq!(h.join().unwrap().len(), 8);
+        assert!(!truncated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_error_codes_are_classified() {
+        assert_eq!(RemoteError::Failed { code: 255, stderr: "ssh: connect to host x port 22: Connection timed out".into() }.code(), "unreachable");
+        assert_eq!(RemoteError::Failed { code: 255, stderr: "user@x: Permission denied (publickey).".into() }.code(), "auth");
+        assert_eq!(RemoteError::Failed { code: 1, stderr: String::new() }.code(), "command");
+        assert_eq!(RemoteError::Timeout { elapsed: Duration::from_secs(10) }.code(), "timeout");
+        assert_eq!(RemoteError::Cancelled { elapsed: Duration::from_secs(1) }.code(), "cancelled");
     }
 
     fn blob(cpu_user: u64, cpu_idle: u64) -> String {
@@ -683,12 +951,13 @@ mod tests {
     #[test]
     fn remote_actions_reject_bad_pid() {
         // 非法 PID 在发 SSH 前即拒绝，不触碰网络
-        assert!(signal("no-such-host", 1, 15).is_err());
-        assert!(signal("no-such-host", 0, 9).is_err());
-        assert!(signal_many("no-such-host", &[0, 1], 15).is_err());
-        assert!(set_nice("no-such-host", 1, 5).is_err());
-        assert_eq!(read_cmdline("no-such-host", 1), None);
-        assert!(read_details("no-such-host", 0).is_none());
+        let h = any_host();
+        assert!(signal(&h, 1, 15).is_err());
+        assert!(signal(&h, 0, 9).is_err());
+        assert!(signal_many(&h, &[0, 1], 15).is_err());
+        assert!(set_nice(&h, 1, 5).is_err());
+        assert_eq!(read_cmdline(&h, 1), None);
+        assert!(read_details(&h, 0).is_none());
     }
 
     #[test]
@@ -696,6 +965,9 @@ mod tests {
         // 需显式指定在线主机才会执行：SM_LIVE_HOST=root@10.44.129.215 cargo test
         let Ok(host) = std::env::var("SM_LIVE_HOST") else {
             return;
+        };
+        let Ok(host) = SshTarget::parse(host.trim()) else {
+            panic!("SM_LIVE_HOST 不是合法 SSH 目标");
         };
         let mut prev = None;
         let s = collect(&host, &mut prev).expect("远端采样应成功");
