@@ -98,9 +98,9 @@ fn base_risk(tool: &str) -> RiskLevel {
     match tool {
         // L0 纯读取
         "hosts_list" | "system_overview" | "system_load" | "process_list" | "network_connections"
-        | "filesystems" => RiskLevel::L0,
+        | "filesystems" | "process_details" => RiskLevel::L0,
         // L1 诊断（只读连接 / 探针元数据）
-        "host_use" | "probe_status" | "probe_search" | "probe_poll" | "scheduler_status" => RiskLevel::L1,
+        "host_use" | "probe_status" | "probe_search" | "probe_poll" | "scheduler_status" | "psi_status" => RiskLevel::L1,
         // L2 可恢复控制
         "process_nice" | "scheduler_set_limit" | "probe_attach" | "probe_detach" => RiskLevel::L2,
         // L3 / 参数敏感

@@ -11,6 +11,7 @@ mod mcp;
 mod mcppolicy;
 mod pi;
 mod platform;
+mod psi;
 mod probe;
 mod probeclient;
 mod procstats;

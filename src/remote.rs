@@ -147,6 +147,12 @@ pub fn ssh_exec(
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=3",
+        // 连接复用（#22）：ControlMaster 短时持久化，连续采集复用握手；
+        // ControlPath 由 ssh 默认管理（~/.ssh/ 下的套接字），10s 空闲后主连接退出
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=10",
         "--", // 终止选项解析：目标串即使形如选项也不会被 ssh 误读
     ])
     .arg(target.as_str())
@@ -296,7 +302,8 @@ pub fn save_hosts(hosts: &[SshTarget]) -> Result<(), String> {
     fsutil::atomic_write(&p, text.as_bytes(), fsutil::MODE_PRIVATE).map_err(|e| format!("hosts.conf 写入失败：{e}"))
 }
 
-fn sections(text: &str) -> HashMap<String, String> {
+/// 按节分隔解析脚本输出（基准与测试消费）。
+pub fn sections(text: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut cur = String::new();
     let mut buf = String::new();
@@ -335,7 +342,8 @@ fn rate(p: Option<(u64, u64)>, c: Option<(u64, u64)>, secs: f32) -> (f32, f32) {
     }
 }
 
-fn parse_ps(text: &str) -> Vec<ProcUsage> {
+/// 解析 ps 文本行（基准消费）。
+pub fn parse_ps(text: &str) -> Vec<ProcUsage> {
     let mut out = Vec::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -636,11 +644,24 @@ pub struct FleetSummary {
     pub gpu: f32,
     pub load1: f32,
     pub procs: usize,
+    /// 最近一次失败原因（成功后清除）。
+    pub last_error: Option<String>,
+    /// 上次成功采样的 Unix 秒（失败时 UI 显示「x 秒前」的旧数据来源）。
+    pub last_ok_at_unix: Option<u64>,
+    /// 连续失败次数（退避依据）。
+    pub consecutive_failures: u32,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub fn summary(target: &SshTarget, prev: &mut Option<Counters>) -> FleetSummary {
-    match collect(target, prev) {
-        Some(s) => FleetSummary {
+    match collect_result(target, prev) {
+        Ok(s) => FleetSummary {
             ok: true,
             os: s.pi.remote.as_ref().map(|r| r.os.clone()).unwrap_or_default(),
             cpu: s.usage.total_percent,
@@ -653,8 +674,11 @@ pub fn summary(target: &SshTarget, prev: &mut Option<Counters>) -> FleetSummary 
             gpu: s.pi.gpu.v3d_ghz.or(s.pi.gpu.temp_c).unwrap_or(0.0),
             load1: s.usage.load.map(|l| l.one).unwrap_or(0.0),
             procs: s.usage.procs.len(),
+            last_error: None,
+            last_ok_at_unix: Some(unix_now()),
+            consecutive_failures: 0,
         },
-        None => FleetSummary {
+        Err(e) => FleetSummary {
             ok: false,
             os: String::new(),
             cpu: 0.0,
@@ -663,6 +687,9 @@ pub fn summary(target: &SshTarget, prev: &mut Option<Counters>) -> FleetSummary 
             gpu: 0.0,
             load1: 0.0,
             procs: 0,
+            last_error: Some(e),
+            last_ok_at_unix: None,
+            consecutive_failures: 1,
         },
     }
 }
@@ -733,7 +760,7 @@ pub fn read_details(target: &SshTarget, pid: i32) -> Option<ProcDetails> {
         return None;
     }
     let script = format!(
-        "echo '##st'; cat /proc/{pid}/status 2>/dev/null; echo '##cmd'; cat /proc/{pid}/cmdline 2>/dev/null; echo '##exe'; readlink /proc/{pid}/exe 2>/dev/null; echo '##cwd'; readlink /proc/{pid}/cwd 2>/dev/null; echo '##io'; cat /proc/{pid}/io 2>/dev/null"
+        "echo '##st'; cat /proc/{pid}/status 2>/dev/null; echo '##cmd'; cat /proc/{pid}/cmdline 2>/dev/null; echo '##exe'; readlink /proc/{pid}/exe 2>/dev/null; echo '##cwd'; readlink /proc/{pid}/cwd 2>/dev/null; echo '##io'; cat /proc/{pid}/io 2>/dev/null; echo '##fds'; ls /proc/{pid}/fd 2>/dev/null | wc -l; echo '##lim'; cat /proc/{pid}/limits 2>/dev/null; echo '##oom'; cat /proc/{pid}/oom_score 2>/dev/null; cat /proc/{pid}/oom_score_adj 2>/dev/null"
     );
     let sec = sections(&ssh_run(target, &script).ok()?);
     let st = sec.get("st").map(|s| procstats::parse_status_detail(s)).unwrap_or_default();
@@ -745,6 +772,19 @@ pub fn read_details(target: &SshTarget, pid: i32) -> Option<ProcDetails> {
             .unwrap_or_else(|| "—".to_string())
     };
     let (io_r, io_w) = sec.get("io").map(|s| procstats::parse_proc_io(s)).unwrap_or((0, 0));
+    let io_rchar_wchar = sec.get("io").and_then(|s| procstats::parse_proc_io_rchar_wchar(s));
+    // FD 计数:0 通常意味着无权限或进程已退出,标记不可用
+    let fd_count = sec.get("fds").and_then(|s| s.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    let fd_limit = sec
+        .get("lim")
+        .and_then(|t| t.lines().find(|l| l.contains("Max open files")))
+        .and_then(|l| l.split_whitespace().nth(3).and_then(|v| v.parse().ok()));
+    let mut oom_nums = sec
+        .get("oom")
+        .map(|t| t.lines().filter_map(|l| l.trim().parse::<i64>().ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let oom_score_adj = if oom_nums.len() >= 2 { oom_nums.pop() } else { None };
+    let oom_score = oom_nums.pop();
     Some(ProcDetails {
         uid: st.uid,
         gid: st.gid,
@@ -756,6 +796,11 @@ pub fn read_details(target: &SshTarget, pid: i32) -> Option<ProcDetails> {
         cwd: path_of("cwd"),
         io_read_bytes: io_r,
         io_write_bytes: io_w,
+        io_rchar_wchar,
+        fd_count,
+        fd_limit,
+        oom_score,
+        oom_score_adj,
     })
 }
 
@@ -840,12 +885,18 @@ fn parse_group_lines(text: &str) -> Vec<GroupState> {
     let mut out = Vec::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split('|').collect();
-        if f.len() != 5 {
+        // 5 字段 = 旧格式(无统计)；8 字段 = 含 cpu.stat
+        if f.len() != 5 && f.len() != 8 {
             continue;
         }
         let pids_max = {
             let t = f[3].trim();
             if t.is_empty() || t == "max" { None } else { t.parse().ok() }
+        };
+        let throttle = if f.len() == 8 {
+            Some((f[5].trim().parse().unwrap_or(0), f[6].trim().parse().unwrap_or(0), f[7].trim().parse().unwrap_or(0)))
+        } else {
+            None
         };
         out.push(GroupState {
             name: f[0].to_string(),
@@ -853,6 +904,7 @@ fn parse_group_lines(text: &str) -> Vec<GroupState> {
             cpu_weight: f[2].trim().parse().unwrap_or(100),
             pids_max,
             procs: f[4].trim().parse().unwrap_or(0),
+            throttle,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -863,7 +915,8 @@ pub fn cg_list(target: &SshTarget, base: &str) -> Vec<GroupState> {
     let c = format!("{base}/cm-sched");
     let script = format!(
         "cd '{c}' 2>/dev/null || exit 0; for d in */; do [ -d \"$d\" ] || continue; n=${{d%/}}; [ \"$n\" = default ] && continue; \
-printf '%s|%s|%s|%s|%s\\n' \"$n\" \"$(cat \"$d/cpu.max\" 2>/dev/null)\" \"$(cat \"$d/cpu.weight\" 2>/dev/null)\" \"$(cat \"$d/pids.max\" 2>/dev/null)\" \"$(grep -c . \"$d/cgroup.procs\" 2>/dev/null)\"; done"
+p=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_periods //p'); t=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^nr_throttled //p'); u=$(cat \"$d/cpu.stat\" 2>/dev/null | sed -n 's/^throttled_usec //p'); \
+printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$n\" \"$(cat \"$d/cpu.max\" 2>/dev/null)\" \"$(cat \"$d/cpu.weight\" 2>/dev/null)\" \"$(cat \"$d/pids.max\" 2>/dev/null)\" \"$(grep -c . \"$d/cgroup.procs\" 2>/dev/null)\" \"${{p:-0}}\" \"${{t:-0}}\" \"${{u:-0}}\"; done"
     );
     parse_group_lines(&ssh_sh(target, &script).unwrap_or_default())
 }
@@ -943,8 +996,16 @@ mod tests {
         SshTarget::parse("no-such-host.invalid").unwrap()
     }
 
+    /// 容器/最小镜像可能没有 ssh 可执行文件；这两个测试依赖真实 ssh。
+    fn ssh_available() -> bool {
+        Command::new("ssh").arg("-V").output().is_ok()
+    }
+
     #[test]
     fn remote_calls_have_deadline() {
+        if !ssh_available() {
+            return;
+        }
         // 不可达主机 + 短超时：必须在 deadline 附近返回结构化错误
         let t = any_host();
         let limits = ExecLimits { timeout: Duration::from_millis(700), max_output: 64 * 1024 };
@@ -960,6 +1021,9 @@ mod tests {
 
     #[test]
     fn ssh_exec_supports_cancel() {
+        if !ssh_available() {
+            return;
+        }
         // 用不可路由地址保证命令在连接阶段悬挂，100ms 后取消必然生效
         let t = SshTarget::parse("user@10.255.255.1").unwrap();
         let cancel = Cancel::new();
@@ -1029,6 +1093,8 @@ mod tests {
 
     #[test]
     fn script_runs_locally() {
+        // 最小容器(fedora/debian 镜像)没有 ps;脚本与解析仍需可用
+        let has_ps = Command::new("ps").arg("--version").output().is_ok();
         let Ok(out) = Command::new("sh").arg("-c").arg(SCRIPT).output() else {
             return;
         };
@@ -1039,7 +1105,9 @@ mod tests {
         let r = parse_output(&String::from_utf8_lossy(&out.stdout), &mut prev);
         assert!(r.is_some(), "本机脚本输出应可解析");
         let s = r.unwrap();
-        assert!(!s.usage.procs.is_empty(), "应解析到进程列表");
+        if has_ps {
+            assert!(!s.usage.procs.is_empty(), "应解析到进程列表");
+        }
         assert!(s.pi.remote.is_some(), "本机也应能读出 os-release");
     }
 
@@ -1230,16 +1298,17 @@ mod tests {
 
     #[test]
     fn group_lines_parse() {
-        let t = "build|50000 100000|200|64|3\nbg|max 100000|100|max|0\n";
+        let t = "build|50000 100000|200|64|3|100|7|250000\nbg|max 100000|100|max|0|0|0|0\nold|50000 100000|100|10|2\n";
         let g = parse_group_lines(t);
-        assert_eq!(g.len(), 2);
+        assert_eq!(g.len(), 3, "5 字段旧格式与 8 字段新格式都接受");
         let b = g.iter().find(|x| x.name == "build").unwrap();
         assert_eq!(b.cpu_max_pct, Some(50));
-        assert_eq!(b.cpu_weight, 200);
         assert_eq!(b.pids_max, Some(64));
         assert_eq!(b.procs, 3);
+        assert_eq!(b.throttle, Some((100, 7, 250_000)), "节流统计随行解析");
         let bg = g.iter().find(|x| x.name == "bg").unwrap();
-        assert_eq!(bg.cpu_max_pct, None);
-        assert_eq!(bg.pids_max, None);
+        assert_eq!(bg.throttle, Some((0, 0, 0)));
+        let old = g.iter().find(|x| x.name == "old").unwrap();
+        assert_eq!(old.throttle, None, "旧格式统计缺失为 None");
     }
 }

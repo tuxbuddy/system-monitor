@@ -201,6 +201,14 @@ pub struct ProcDetails {
     pub cwd: String,
     pub io_read_bytes: u64,
     pub io_write_bytes: u64,
+    /// 实际 I/O 字节（rchar/wchar，含缓存命中）；权限不足为 None。
+    pub io_rchar_wchar: Option<(u64, u64)>,
+    /// FD 数量与 open files 软上限；无权限为 None（部分可用语义）。
+    pub fd_count: Option<u64>,
+    pub fd_limit: Option<u64>,
+    /// OOM 评分：oom_score 与 oom_score_adj。
+    pub oom_score: Option<i64>,
+    pub oom_score_adj: Option<i64>,
 }
 
 /// 按需读取某个进程的详细信息（供详情弹窗用）。
@@ -214,9 +222,24 @@ pub fn read_details(pid: i32) -> ProcDetails {
     let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "—".to_string());
-    let (io_read_bytes, io_write_bytes) = fs::read_to_string(format!("/proc/{pid}/io"))
-        .map(|s| parse_proc_io(&s))
-        .unwrap_or((0, 0));
+    let io_text = fs::read_to_string(format!("/proc/{pid}/io"));
+    let (io_read_bytes, io_write_bytes) = io_text.as_deref().map(parse_proc_io).unwrap_or((0, 0));
+    let io_rchar_wchar = io_text.ok().and_then(|s| parse_proc_io_rchar_wchar(&s));
+    // FD 数量：读目录项；无权限(None)时该项标记不可用而非整体失败
+    let fd_count = fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .map(|entries| entries.filter_map(|e| e.ok()).count() as u64);
+    // open files 软上限（limits 的 "Max open files" 第 4 列）
+    let fd_limit = fs::read_to_string(format!("/proc/{pid}/limits"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.contains("Max open files"))
+                .and_then(|l| l.split_whitespace().nth(3).and_then(|v| v.parse().ok()))
+        });
+    let read_num = |name: &str| -> Option<i64> {
+        fs::read_to_string(format!("/proc/{pid}/{name}")).ok().and_then(|t| t.trim().parse().ok())
+    };
     ProcDetails {
         uid: d.uid,
         gid: d.gid,
@@ -228,7 +251,34 @@ pub fn read_details(pid: i32) -> ProcDetails {
         cwd,
         io_read_bytes,
         io_write_bytes,
+        io_rchar_wchar,
+        fd_count,
+        fd_limit,
+        oom_score: read_num("oom_score"),
+        oom_score_adj: read_num("oom_score_adj"),
     }
+}
+
+/// 解析 /proc/<pid>/io 的 rchar/wchar（实际 I/O 含缓存）；两者齐备才算可用。
+pub fn parse_proc_io_rchar_wchar(text: &str) -> Option<(u64, u64)> {
+    let mut rchar = None;
+    let mut wchar = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("rchar:") {
+            rchar = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("wchar:") {
+            wchar = rest.trim().parse().ok();
+        }
+    }
+    Some((rchar?, wchar?))
+}
+
+/// 解析 /proc/vmstat 中的 oom_kill 累计计数（系统级 OOM 事件）。
+pub fn parse_vmstat_oom_kill(text: &str) -> Option<u64> {
+    text.lines()
+        .find(|l| l.starts_with("oom_kill "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
 }
 
 #[derive(Clone, Debug)]
@@ -836,6 +886,12 @@ pub struct Sampler {
     prev_at: Instant,
 }
 
+impl Default for Sampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sampler {
     pub fn new() -> Self {
         Self { prev: None, prev_at: Instant::now() }
@@ -1162,6 +1218,21 @@ mod tests {
         let (rx, tx) = parse_netdev(text).unwrap();
         assert_eq!(rx, 5000);
         assert_eq!(tx, 7000);
+    }
+
+    #[test]
+    fn parse_proc_io_rchar_wchar_partial_means_none() {
+        assert_eq!(parse_proc_io_rchar_wchar("rchar: 100\nwchar: 200\n"), Some((100, 200)));
+        // 权限不足时 io 为空/缺字段 → None(部分可用语义)
+        assert_eq!(parse_proc_io_rchar_wchar("rchar: 100\n"), None);
+        assert_eq!(parse_proc_io_rchar_wchar(""), None);
+    }
+
+    #[test]
+    fn parse_vmstat_oom_kill_count() {
+        let t = "pgfault 12345\noom_kill 7\npgfree 99\n";
+        assert_eq!(parse_vmstat_oom_kill(t), Some(7));
+        assert_eq!(parse_vmstat_oom_kill("pgfault 1\n"), None);
     }
 
     #[test]

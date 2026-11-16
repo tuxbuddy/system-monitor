@@ -72,6 +72,8 @@ pub struct GroupState {
     pub cpu_weight: u32,
     pub pids_max: Option<u32>,
     pub procs: usize,
+    /// cpu.stat 节流统计 (nr_periods, nr_throttled, throttled_usec)；文件缺失 None。
+    pub throttle: Option<(u64, u64, u64)>,
 }
 
 pub struct CgroupManager {
@@ -91,6 +93,107 @@ fn cleanup_created(container: &Path, created_now: bool) {
     if created_now {
         let _ = std::fs::remove_dir(container);
     }
+}
+
+/// 分组内核统计（#20）。GUI 分组卡片与 MCP scheduler_groups 消费；
+/// 远端路径经 GroupState.throttle 携带,本结构供本地精细查询扩展。
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CgStats {
+    pub cpu: CpuStat,
+    pub memory: Option<EventsCounters>,
+    pub pids: Option<EventsCounters>,
+    pub memory_current_bytes: Option<u64>,
+    pub pids_current: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl CgStats {
+    /// 节流时间占比：throttled_usec / 周期×period? 无 period 信息，改以
+    /// 被限流次数占周期次数比例表示（0..=1；除零安全）。
+    pub fn throttle_ratio(&self) -> f64 {
+        if self.cpu.nr_periods == 0 {
+            0.0
+        } else {
+            self.cpu.nr_throttled as f64 / self.cpu.nr_periods as f64
+        }
+    }
+
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "cpu_stat": {
+                "nr_periods": self.cpu.nr_periods,
+                "nr_throttled": self.cpu.nr_throttled,
+                "throttled_usec": self.cpu.throttled_usec,
+                "throttled_ratio": round_ratio(self.throttle_ratio()),
+            },
+            "memory_events": self.memory.map(events_json),
+            "pids_events": self.pids.map(events_json),
+            "memory_current_bytes": self.memory_current_bytes,
+            "pids_current": self.pids_current,
+        })
+    }
+}
+
+fn round_ratio(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+/// cpu.stat 计数器（#20）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CpuStat {
+    pub nr_periods: u64,
+    pub nr_throttled: u64,
+    pub throttled_usec: u64,
+}
+
+/// 解析 cpu.stat：三键齐备才算有效（异常行忽略，缺键 None）。
+pub fn parse_cpu_stat(text: &str) -> CpuStat {
+    let mut out = CpuStat::default();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next().and_then(|v| v.parse::<u64>().ok())) {
+            (Some("nr_periods"), Some(v)) => out.nr_periods = v,
+            (Some("nr_throttled"), Some(v)) => out.nr_throttled = v,
+            (Some("throttled_usec"), Some(v)) => out.throttled_usec = v,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// memory.events / pids.events 计数器。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct EventsCounters {
+    pub low: u64,
+    pub high: u64,
+    pub max: u64,
+    pub oom: u64,
+    pub oom_kill: u64,
+}
+
+/// 解析 events 文件；已知的五键取值，未知键忽略，全部缺省为 0（不 panic）。
+#[allow(dead_code)]
+pub fn parse_events_file(text: &str) -> EventsCounters {
+    let mut out = EventsCounters::default();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next().and_then(|v| v.parse::<u64>().ok())) {
+            (Some("low"), Some(v)) => out.low = v,
+            (Some("high"), Some(v)) => out.high = v,
+            (Some("max"), Some(v)) => out.max = v,
+            (Some("oom"), Some(v)) => out.oom = v,
+            (Some("oom_kill"), Some(v)) => out.oom_kill = v,
+            _ => {}
+        }
+    }
+    out
+}
+
+fn events_json(e: EventsCounters) -> serde_json::Value {
+    serde_json::json!({"low": e.low, "high": e.high, "max": e.max, "oom": e.oom, "oom_kill": e.oom_kill})
 }
 
 /// 单项体检结果：名字、是否通过、人可读详情（GUI 状态栏与 MCP scheduler_status 复用）。
@@ -288,6 +391,33 @@ impl CgroupManager {
         std::fs::read_to_string(self.group_path(name).join("cpu.max")).ok()
     }
 
+    /// 分组内核统计（#20）：cpu.stat 节流、memory/pids events。
+    /// 文件缺失返回 None（控制器未启用），解析失败按 0 兜底不 panic。
+    /// （供 GUI 分组卡片与 MCP 扩展查询;scheduler_groups 已走 GroupState.throttle）
+    #[allow(dead_code)]
+    pub fn read_group_stats(&self, name: &str) -> Option<CgStats> {
+        if !valid_group_name(name) {
+            return None;
+        }
+        let g = self.group_path(name);
+        let cpu_stat = std::fs::read_to_string(g.join("cpu.stat")).ok()?;
+        let mem_events = std::fs::read_to_string(g.join("memory.events")).ok();
+        let pids_events = std::fs::read_to_string(g.join("pids.events")).ok();
+        let mem_current = std::fs::read_to_string(g.join("memory.current"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        let pids_current = std::fs::read_to_string(g.join("pids.current"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        Some(CgStats {
+            cpu: parse_cpu_stat(&cpu_stat),
+            memory: mem_events.as_deref().map(parse_events_file),
+            pids: pids_events.as_deref().map(parse_events_file),
+            memory_current_bytes: mem_current,
+            pids_current,
+        })
+    }
+
     pub fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<(), CgError> {
         if !valid_group_name(name) {
             return Err(CgError::Invalid("非法分组名".into()));
@@ -368,7 +498,11 @@ impl CgroupManager {
             let procs = std::fs::read_to_string(path.join("cgroup.procs"))
                 .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
                 .unwrap_or(0);
-            out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs });
+            let throttle = std::fs::read_to_string(path.join("cpu.stat")).ok().map(|t| {
+                let c = parse_cpu_stat(&t);
+                (c.nr_periods, c.nr_throttled, c.throttled_usec)
+            });
+            out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs, throttle });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -406,6 +540,28 @@ mod tests {
         assert_eq!(pct_to_cpu_max(200), "200000 100000");
         assert_eq!(parse_cpu_max("200000 100000"), Some(200));
         assert_eq!(parse_cpu_max("max 100000"), None);
+    }
+
+    #[test]
+    fn parse_cpu_stat_keys() {
+        let t = "nr_periods 100\nnr_throttled 7\nthrottled_usec 250000\n";
+        let c = parse_cpu_stat(t);
+        assert_eq!(c, CpuStat { nr_periods: 100, nr_throttled: 7, throttled_usec: 250_000 });
+        // 异常行忽略、缺键 0(不 panic)
+        let g = parse_cpu_stat("garbage line\nnr_periods 5\nbroken\n");
+        assert_eq!(g.nr_periods, 5);
+        assert_eq!(g.nr_throttled, 0);
+    }
+
+    #[test]
+    fn parse_events_and_throttle_ratio() {
+        let e = parse_events_file("low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\nkill_unknown 9\n");
+        assert_eq!(e, EventsCounters { low: 1, high: 2, max: 3, oom: 4, oom_kill: 5 });
+        let st = CgStats { cpu: CpuStat { nr_periods: 4, nr_throttled: 1, throttled_usec: 10 }, ..Default::default() };
+        assert!((st.throttle_ratio() - 0.25).abs() < 1e-9);
+        // 除零安全
+        let zero = CgStats::default();
+        assert_eq!(zero.throttle_ratio(), 0.0);
     }
 
     #[test]

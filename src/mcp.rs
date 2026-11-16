@@ -365,6 +365,47 @@ impl Server {
                     }
                 }
             }
+            "process_details" => {
+                let pid = args.get("pid").and_then(|v| v.as_i64()).ok_or("缺少 pid")? as i32;
+                if pid <= 1 {
+                    return Err("拒绝查询 PID ≤ 1".to_string());
+                }
+                if self.target(args)?.is_some() {
+                    return Err("process_details 目前仅支持本地主机（远端用 process_list + host 上直接查询）".to_string());
+                }
+                let d = procstats::read_details(pid);
+                Ok(json!({
+                    "host": "local",
+                    "pid": pid,
+                    "uid": d.uid, "gid": d.gid, "threads": d.threads,
+                    "vsize_kb": d.vsize_kb, "rss_kb": d.rss_kb,
+                    "cmdline": d.cmdline, "exe": d.exe, "cwd": d.cwd,
+                    "io_read_bytes": d.io_read_bytes, "io_write_bytes": d.io_write_bytes,
+                    "io_rchar_wchar": d.io_rchar_wchar,
+                    "fd_count": d.fd_count, "fd_limit": d.fd_limit,
+                    "oom_score": d.oom_score, "oom_score_adj": d.oom_score_adj,
+                }))
+            }
+            "psi_status" => {
+                let snap = crate::psi::read_local();
+                // cgroup v2 委派根下的 *.pressure 作为补充源(本地 /proc/pressure 缺失时尤其有用)
+                let cg = std::env::var_os("HOME")
+                    .and_then(|_| {
+                        let uid = unsafe { libc::getuid() };
+                        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+                        crate::cgroup::parse_self_cgroup(&text, uid)
+                    })
+                    .and_then(|rel| std::fs::read_to_string("/sys/fs/cgroup").ok().map(|_| rel));
+                let cgroup_pressure = cg.map(|rel| {
+                    let dir = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
+                    crate::psi::read_cgroup(&dir)
+                });
+                Ok(json!({
+                    "host": "local",
+                    "pressure": snap.to_json(),
+                    "cgroup_pressure": cgroup_pressure.map(|p| p.to_json()),
+                }))
+            }
             "scheduler_status" => {
                 // cgroup 调度体检：逐步报告委派/控制器/可写性，失败给修复建议
                 let checks = crate::cgroup::doctor();
@@ -636,6 +677,10 @@ fn freshness_json(v: &View) -> Value {
     })
 }
 
+fn system_oom_kill() -> Option<u64> {
+    std::fs::read_to_string("/proc/vmstat").ok().and_then(|t| procstats::parse_vmstat_oom_kill(&t))
+}
+
 fn overview_json(v: &View) -> Value {
     let mem = v.usage.mem.map(|m| {
         json!({
@@ -676,6 +721,7 @@ fn overview_json(v: &View) -> Value {
         "filesystems": v.filesystems.len(),
         "connections": v.conns.len(),
         "freshness": freshness_json(v),
+        "oom_kill_total": system_oom_kill(),
     })
 }
 
@@ -683,9 +729,14 @@ fn groups_json(groups: &[crate::cgroup::GroupState]) -> Vec<Value> {
     groups
         .iter()
         .map(|g| {
+            let throttle = g.throttle.map(|(periods, throttled, usec)| {
+                let ratio = if periods == 0 { 0.0 } else { throttled as f64 / periods as f64 };
+                json!({"nr_periods": periods, "nr_throttled": throttled, "throttled_usec": usec, "throttled_ratio": (ratio * 1000.0).round() / 1000.0})
+            });
             json!({
                 "name": g.name, "cpu_max_percent": g.cpu_max_pct, "cpu_weight": g.cpu_weight,
                 "pids_max": g.pids_max, "process_count": g.procs,
+                "cpu_throttle": throttle,
             })
         })
         .collect()
@@ -794,6 +845,18 @@ fn tools() -> Vec<Value> {
         tool(
             "scheduler_status",
             "本机 cgroup 调度体检：cgroup v2 / 委派 / 控制器 / 可写性逐项报告，失败附原因与修复建议。",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "process_details",
+            "本地进程详情：uid/gid/线程数/内存、I/O 字节(read/write 与 rchar/wchar)、FD 数量与上限、OOM 评分。",
+            json!({"pid": {"type": "integer"}}),
+            &["pid"],
+        ),
+        tool(
+            "psi_status",
+            "本机 PSI 压力失速指标：cpu/memory/io 的 some/full(avg10/60/300 与 total)。内核未启用 PSI 时标记 unsupported,不伪造 0。",
             json!({}),
             &[],
         ),
