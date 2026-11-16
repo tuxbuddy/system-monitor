@@ -65,7 +65,7 @@ pub struct App {
     history: VecDeque<f32>,
     hosts: Vec<remote::SshTarget>,
     host_idx: Option<usize>,
-    shared: Arc<Mutex<Option<remote::RemoteSample>>>,
+    shared: Arc<Mutex<remote::RemoteSlot>>,
     prev: Arc<Mutex<Option<remote::Counters>>>,
     busy: Arc<AtomicBool>,
     last_kick: Instant,
@@ -91,7 +91,7 @@ impl App {
             history: VecDeque::new(),
             hosts: remote::load_hosts().0,
             host_idx: None,
-            shared: Arc::new(Mutex::new(None)),
+            shared: Arc::new(Mutex::new(remote::RemoteSlot::new())),
             prev: Arc::new(Mutex::new(None)),
             busy: Arc::new(AtomicBool::new(false)),
             last_kick: Instant::now(),
@@ -133,29 +133,48 @@ impl App {
     }
 
     fn resample_remote(&mut self, target: &remote::SshTarget) {
-        let kick = self.last_kick.elapsed() >= self.interval && !self.busy.load(Ordering::Relaxed);
+        // 与 GUI 相同的代次化采样：过期代次回写被丢弃，切主机不显示旧数据
+        let key = target.as_str().to_string();
+        let ticket = {
+            let Ok(mut slot) = self.shared.lock() else {
+                return;
+            };
+            let switched = slot.host != key;
+            if switched {
+                slot.reset_for(&key)
+            } else {
+                slot.generation
+            }
+        };
+        let inflight = self.busy.load(Ordering::Relaxed);
+        let kick = self.last_kick.elapsed() >= self.interval && !inflight;
         if kick && !self.paused {
+            let mut ticket = ticket;
             self.busy.store(true, Ordering::Relaxed);
             self.last_kick = Instant::now();
             let shared = self.shared.clone();
             let prev = self.prev.clone();
             let busy = self.busy.clone();
             let t = target.clone();
+            let kick_key = key.clone();
+            if let Ok(mut slot) = self.shared.lock() {
+                ticket = slot.reset_for(&key); // 本轮回写凭证
+            }
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
                 let res = remote::collect(&t, &mut p);
                 if let Ok(mut g) = prev.lock() {
                     *g = p;
                 }
-                if res.is_some()
+                if let Some(sample) = res
                     && let Ok(mut s) = shared.lock()
                 {
-                    *s = res;
+                    s.accept(&kick_key, ticket, sample);
                 }
                 busy.store(false, Ordering::Relaxed);
             });
         }
-        if let Some(s) = self.shared.lock().ok().and_then(|g| (*g).clone()) {
+        if let Some(s) = self.shared.lock().ok().and_then(|g| g.current(&key).cloned()) {
             self.usage = s.usage;
             self.pi = s.pi;
             self.last = Instant::now();
@@ -171,7 +190,7 @@ impl App {
             Some(_) => None,
         };
         if let Ok(mut s) = self.shared.lock() {
-            *s = None;
+            s.sample = None; // 主机切换：清空槽，旧线程回写因 host 不匹配被丢弃
         }
         if let Ok(mut p) = self.prev.lock() {
             *p = None;

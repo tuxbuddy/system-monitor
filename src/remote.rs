@@ -39,7 +39,8 @@ pub struct Cancel {
 }
 
 impl Cancel {
-    /// GUI/MCP 侧创建共享取消句柄（后续波次接线主机切换/退出取消；测试覆盖取消路径）。
+    /// GUI/MCP 侧创建共享取消句柄（当前调用方经 ssh_exec 的 Option 传入，
+    /// 主机切换/退出时统一置位；预留接线）。
     #[allow(dead_code)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -116,7 +117,7 @@ fn truncate_tail(s: &str, max: usize) -> &str {
 #[derive(Debug)]
 pub struct ExecOutput {
     pub stdout: String,
-    /// 保留诊断信息：失败分类（auth/unreachable）依赖它
+    /// 保留诊断信息：失败分类（auth/unreachable）依赖它，Display 已消费
     #[allow(dead_code)]
     pub stderr: String,
     /// 输出超过上限被截断（数据不完整，调用方需感知）。
@@ -424,6 +425,56 @@ pub struct RemoteSample {
     pub pi: PiStats,
     pub filesystems: Vec<FsUsage>,
     pub conns: Vec<NetConn>,
+}
+
+/// 远端采样共享槽：绑定主机与代次，杜绝「切主机后旧线程把上一台主机的
+/// 数据写回共享槽」的竞态。
+///
+/// - [`RemoteSlot::reset_for`] 在切换主机时递增代次并清空样本，返回新代次；
+/// - 采样线程完成后经 [`RemoteSlot::accept`] 校验 host+generation，
+///   过期代次（主机已切换）的写入被直接丢弃；
+/// - 消费端 [`RemoteSlot::current`] 只在槽内 host 与查询一致时给出数据。
+#[derive(Default)]
+pub struct RemoteSlot {
+    pub host: String,
+    pub generation: u64,
+    pub sample: Option<RemoteSample>,
+    pub sampled_at: Option<Instant>,
+}
+
+impl RemoteSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 切换/选定主机：清空旧样本并递增代次，返回新代次（采样回写凭证）。
+    /// 同一主机重复调用也递增代次（强制重新采样，不复用过期结果）。
+    pub fn reset_for(&mut self, host: &str) -> u64 {
+        self.host = host.to_string();
+        self.generation += 1;
+        self.sample = None;
+        self.sampled_at = None;
+        self.generation
+    }
+
+    /// 采样线程回写：host 与 generation 都匹配才接受，过期写入返回 false 丢弃。
+    pub fn accept(&mut self, host: &str, generation: u64, sample: RemoteSample) -> bool {
+        if self.host != host || self.generation != generation {
+            return false;
+        }
+        self.sample = Some(sample);
+        self.sampled_at = Some(Instant::now());
+        true
+    }
+
+    /// 消费端读取：仅当槽内主机与当前选择一致时返回样本。
+    pub fn current(&self, host: &str) -> Option<&RemoteSample> {
+        if self.host == host {
+            self.sample.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// 解析一次脚本输出；用 prev 累计量算 CPU/磁盘/网络增量与 RAPL 功耗。
@@ -984,6 +1035,53 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let alive = ssh_run(&host, &format!("test -d /proc/{pid} && echo alive || echo gone")).unwrap();
         assert!(alive.contains("gone"), "进程应已被结束");
+    }
+
+    fn dummy_sample(idle: u64) -> RemoteSample {
+        let mut prev = None;
+        parse_output(&blob(100, idle), &mut prev).unwrap()
+    }
+
+    #[test]
+    fn stale_generation_writes_are_dropped() {
+        let mut slot = RemoteSlot::new();
+        let g1 = slot.reset_for("h1");
+        slot.reset_for("h2"); // 主机切换：h1 的旧代次立即过期
+        // 旧代次线程晚到：主机已切到 h2，写入必须被丢弃
+        assert!(!slot.accept("h1", g1, dummy_sample(100)), "主机已切换，旧主机写入应丢弃");
+        assert!(slot.current("h2").is_none(), "新主机不应看到旧数据");
+        let g2 = slot.reset_for("h2");
+        assert!(slot.accept("h2", g2, dummy_sample(200)));
+        assert!(slot.current("h2").is_some());
+        // 再切回 h1：g2 的迟到写入同样被丢弃
+        let g3 = slot.reset_for("h1");
+        assert!(!slot.accept("h2", g2, dummy_sample(300)), "主机已切回 h1，h2 的旧写入应丢弃");
+        assert!(slot.current("h1").is_none(), "切回后应重新采样而非复用旧结果");
+        assert!(slot.accept("h1", g3, dummy_sample(400)));
+    }
+
+    #[test]
+    fn rapid_host_switching_never_pollutes() {
+        // 并发场景：后台线程持旧代次凭证延迟回写，同时 UI 快速来回切换
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(RemoteSlot::new()));
+        let mut handles = Vec::new();
+        let g1 = slot.lock().unwrap().reset_for("h1");
+        for i in 0..8 {
+            let slot2 = slot.clone();
+            handles.push(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5 * (8 - i)));
+                let s = dummy_sample(100 + i);
+                slot2.lock().unwrap().accept("h1", g1, s);
+            }));
+        }
+        let g2 = slot.lock().unwrap().reset_for("h2");
+        // h1 的所有在途写入都应因代次过期被丢弃
+        for h in handles {
+            h.join().unwrap();
+        }
+        let guard = slot.lock().unwrap();
+        assert_eq!(guard.generation, g2);
+        assert!(guard.sample.is_none(), "h1 旧线程不得污染 h2");
     }
 
     #[test]

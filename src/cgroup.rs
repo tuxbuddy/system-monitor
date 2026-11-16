@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub enum CgError {
     NotDelegated,
+    /// cgroup.controllers 有控制器，但 subtree_control 写入后读回未生效
+    /// （典型原因：systemd 未委派该控制器、cgroup v1、挂载只读）。
+    ControllerNotEnabled { missing: Vec<String> },
     Permission,
     Gone,
     Io(String),
@@ -13,6 +16,11 @@ impl std::fmt::Display for CgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotDelegated => write!(f, "调度不可用：当前不在可委派的 cgroup 子树内"),
+            Self::ControllerNotEnabled { missing } => write!(
+                f,
+                "控制器未启用：{} 不在 cgroup.subtree_control 中（检查 systemd Delegate= 或 cgroup 版本）",
+                missing.join(", ")
+            ),
             Self::Permission => write!(f, "权限不足：需在用户会话内运行"),
             Self::Gone => write!(f, "进程或 cgroup 已不存在"),
             Self::Io(e) => write!(f, "cgroup 操作失败：{e}"),
@@ -78,6 +86,69 @@ fn map_io(e: std::io::Error) -> CgError {
     }
 }
 
+/// 清理本次检测新建的容器：只删空目录，不误删既有内容；失败忽略（幂等）。
+fn cleanup_created(container: &Path, created_now: bool) {
+    if created_now {
+        let _ = std::fs::remove_dir(container);
+    }
+}
+
+/// 单项体检结果：名字、是否通过、人可读详情（GUI 状态栏与 MCP scheduler_status 复用）。
+#[derive(Clone, Debug)]
+pub struct CgCheck {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// cgroup 调度可用性体检：逐步检查并在失败处给出原因与修复建议。
+pub fn doctor() -> Vec<CgCheck> {
+    let mut out = Vec::new();
+    let cgroup_v2 = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+    out.push(CgCheck {
+        name: "cgroup_v2",
+        ok: cgroup_v2,
+        detail: if cgroup_v2 {
+            "统一层级已挂载".to_string()
+        } else {
+            "未检测到 cgroup v2（统一层级）；v1 不支持本工具的调度".to_string()
+        },
+    });
+    let text = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let uid = unsafe { libc::getuid() };
+    let Some(rel) = parse_self_cgroup(&text, uid) else {
+        out.push(CgCheck { name: "delegation", ok: false, detail: "当前会话不在 user@<uid>.service 委派子树内（尝试从用户会话启动）".to_string() });
+        return out;
+    };
+    out.push(CgCheck { name: "delegation", ok: true, detail: format!("委派根：{}", rel.display()) });
+    let root = PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
+    let ctrls = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
+    let has_cpu = ctrls.split_whitespace().any(|c| c == "cpu");
+    let has_pids = ctrls.split_whitespace().any(|c| c == "pids");
+    out.push(CgCheck {
+        name: "controllers",
+        ok: has_cpu && has_pids,
+        detail: format!(
+            "可用控制器{}：{}",
+            if has_cpu && has_pids { "" } else { "（缺失）" },
+            ctrls.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
+    });
+    if !(has_cpu && has_pids) {
+        out.push(CgCheck { name: "subtree_control", ok: false, detail: "上游未委派 cpu/pids，无法继续".to_string() });
+        return out;
+    }
+    let container = root.join("cm-sched");
+    match CgroupManager::detect() {
+        Ok(_) => out.push(CgCheck { name: "subtree_control", ok: true, detail: "cm-sched 就绪：cpu/pids 已启用，cpu.max / pids.max 可写".to_string() }),
+        Err(e) => {
+            out.push(CgCheck { name: "subtree_control", ok: false, detail: format!("检测失败：{e}") });
+            let _ = container;
+        }
+    }
+    out
+}
+
 fn is_writable(p: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
@@ -116,6 +187,8 @@ fn check_own_process(pid: i32) -> Result<(), CgError> {
 }
 
 impl CgroupManager {
+    /// 能力检测以「读回验证」为准：控制器确认启用、目标文件存在且可写才报告可用；
+    /// 本次新建的容器在检测失败时清理，不留半初始化目录。
     pub fn detect() -> Result<Self, CgError> {
         let text = std::fs::read_to_string("/proc/self/cgroup").map_err(map_io)?;
         let uid = unsafe { libc::getuid() };
@@ -129,9 +202,35 @@ impl CgroupManager {
             return Err(CgError::Permission);
         }
         let container = root.join("cm-sched");
+        let created_now = !container.exists();
         std::fs::create_dir_all(&container).map_err(map_io)?;
-        // 容器只放子组、不放进程，才允许为子组启用控制器
-        let _ = std::fs::write(container.join("cgroup.subtree_control"), "+cpu +pids");
+        // 容器只放子组、不放进程，才允许为子组启用控制器。
+        // 写入结果必须读回验证：subtree_control 写入被内核静默拒绝（控制器未委派）
+        // 时不会报错，但不读回就是假阳性。
+        let write_res = std::fs::write(container.join("cgroup.subtree_control"), "+cpu +pids");
+        let readback = std::fs::read_to_string(container.join("cgroup.subtree_control")).unwrap_or_default();
+        let mut missing = Vec::new();
+        for want in ["cpu", "pids"] {
+            if !readback.split_whitespace().any(|c| c == want) {
+                missing.push(want.to_string());
+            }
+        }
+        if !missing.is_empty() || write_res.is_err() {
+            cleanup_created(&container, created_now);
+            return Err(CgError::ControllerNotEnabled { missing });
+        }
+        // 目标文件必须存在且可写，否则调度运行期必然失败
+        for f in ["cpu.max", "pids.max"] {
+            let p = container.join(f);
+            if !p.exists() {
+                cleanup_created(&container, created_now);
+                return Err(CgError::Io(format!("缺少 {f}（cgroup v1 或控制器未挂载？）")));
+            }
+            if !is_writable(&p) {
+                cleanup_created(&container, created_now);
+                return Err(CgError::Permission);
+            }
+        }
         Ok(Self { container })
     }
 
@@ -291,6 +390,26 @@ mod tests {
         assert_eq!(pct_to_cpu_max(200), "200000 100000");
         assert_eq!(parse_cpu_max("200000 100000"), Some(200));
         assert_eq!(parse_cpu_max("max 100000"), None);
+    }
+
+    #[test]
+    fn controller_not_enabled_is_distinct_error() {
+        // 错误分类必须可区分：控制器未启用 ≠ 未委派 ≠ 权限
+        let e = CgError::ControllerNotEnabled { missing: vec!["cpu".into()] };
+        assert!(e.to_string().contains("控制器未启用"));
+        assert!(e.to_string().contains("cpu"));
+        assert_ne!(format!("{}", CgError::NotDelegated), e.to_string());
+    }
+
+    #[test]
+    fn doctor_reports_stepwise_results() {
+        let checks = doctor();
+        assert!(!checks.is_empty());
+        assert!(checks.iter().any(|c| c.name == "cgroup_v2"));
+        // 在无 cgroup v2 的环境（macOS/容器）应明确报不可用而不是空结果
+        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            assert!(!checks[0].ok);
+        }
     }
 
     #[test]
