@@ -94,10 +94,11 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 顺序关键:最小容器没有 curl,必须先装系统依赖再拉 rust-toolchain
       - name: 安装工具链依赖
         run: ${{ matrix.install }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: 测试（纯 TUI）
         run: cargo test --no-default-features --bin system-monitor
       - name: 记录矩阵结果
