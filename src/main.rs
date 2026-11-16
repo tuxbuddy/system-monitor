@@ -7,6 +7,7 @@ mod cgroup;
 mod config;
 mod fsutil;
 mod mcp;
+mod mcppolicy;
 mod pi;
 mod platform;
 mod probe;
@@ -35,6 +36,10 @@ fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|a| a == "mcp-approve") {
+        mcp_approve(&args[1..]);
+        return;
+    }
     let want_tui = args.iter().any(|a| a == "--tui" || a == "--headless" || a == "-t");
     let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
     let tui = cfg!(not(feature = "gui")) || want_tui || !has_display;
@@ -46,6 +51,72 @@ fn main() {
     } else {
         gui_main();
     }
+}
+
+/// 签发 MCP L3 动作的一次性审批凭证（带外：由人在本机执行，token 转交给 AI 会话）。
+/// 用法：system-monitor mcp-approve --tool process_signal --args '{"pid":123,"signal":"KILL"}' --ttl 60
+fn mcp_approve(argv: &[String]) {
+    let mut tool = String::new();
+    let mut raw_args = String::new();
+    let mut ttl: u64 = 60;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--tool" if i + 1 < argv.len() => {
+                i += 1;
+                tool = argv[i].clone();
+            }
+            "--args" if i + 1 < argv.len() => {
+                i += 1;
+                raw_args = argv[i].clone();
+            }
+            "--ttl" if i + 1 < argv.len() => {
+                i += 1;
+                ttl = argv[i].parse().unwrap_or(60);
+            }
+            other => {
+                eprintln!("未知参数：{other}");
+                print_approve_usage();
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    if tool.is_empty() {
+        print_approve_usage();
+        std::process::exit(2);
+    }
+    let args: serde_json::Value = if raw_args.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&raw_args) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("--args 不是合法 JSON：{e}");
+                std::process::exit(2);
+            }
+        }
+    };
+    match mcppolicy::issue_approval(&tool, &args, ttl) {
+        Ok(ap) => {
+            println!("approval_token: {}", ap.token);
+            println!("tool:  {tool}");
+            println!("args:  {}", ap.params);
+            let exp = ap.expires_at;
+            println!("有效期至 unix {exp}（{ttl} 秒）；一次性使用，绑定以上参数。");
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_approve_usage() {
+    eprintln!(
+        "用法：system-monitor mcp-approve --tool <工具名> --args '<参数JSON>' --ttl <秒>\n\
+         示例：system-monitor mcp-approve --tool process_signal --args '{{\"pid\":123,\"signal\":\"KILL\"}}' --ttl 60"
+    );
 }
 
 fn print_help() {

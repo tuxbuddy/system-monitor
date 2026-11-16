@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::mcppolicy::{self, PolicyMode, RiskLevel};
 use crate::pi::PiStats;
 use crate::procstats::{self, FsUsage, NetConn, Sampler, Usage};
 use crate::remote;
@@ -26,6 +27,9 @@ struct View {
 pub struct Server {
     current: Option<remote::SshTarget>,
     hosts: Vec<remote::SshTarget>,
+    /// 服务端强制策略：默认 readonly，禁止隐式升级。
+    policy: PolicyMode,
+    caller: String,
     sampler: Sampler,
     last_local: Instant,
     remote_prev: HashMap<String, Option<remote::Counters>>,
@@ -37,6 +41,8 @@ impl Server {
         let mut s = Self {
             current: None,
             hosts: remote::load_hosts().0,
+            policy: PolicyMode::Readonly,
+            caller: std::env::var("SM_MCP_CALLER").unwrap_or_else(|_| "stdio".to_string()),
             sampler: Sampler::new(),
             last_local: Instant::now() - Duration::from_secs(10),
             remote_prev: HashMap::new(),
@@ -108,8 +114,73 @@ impl Server {
         &self.probe.as_ref().expect("刚刚写入").0
     }
 
+    fn audit(&self, tool: &str, level: RiskLevel, ok: bool, error: Option<&str>) {
+        let host = self.current.as_ref().map(|t| t.as_str()).unwrap_or("local");
+        let ev = mcppolicy::AuditEvent {
+            tool,
+            host,
+            level,
+            ok,
+            error,
+            mode: self.policy,
+            caller: &self.caller,
+        };
+        if let Err(e) = mcppolicy::audit(&ev) {
+            eprintln!("system-monitor mcp: 审计写入失败：{e}");
+        }
+    }
+
+    /// 工具调用统一入口：先做服务端策略裁决（拒绝也审计），再分派执行；
+    /// L2/L3 写操作的执行结果同样审计。
     fn call(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        let token = args.get("approval_token").and_then(|v| v.as_str());
+        let level = mcppolicy::risk_of(name, args);
+        match mcppolicy::check(self.policy, name, args, token) {
+            mcppolicy::Decision::Allow => {}
+            mcppolicy::Decision::NeedTicket { hint } => {
+                self.audit(name, level, false, Some("needs_approval"));
+                return Err(json!({
+                    "error": "needs_approval",
+                    "tool": name,
+                    "level": level.as_str(),
+                    "hint": hint,
+                }).to_string());
+            }
+            mcppolicy::Decision::Deny { error, required_level } => {
+                self.audit(name, level, false, Some("policy_denied"));
+                return Err(json!({
+                    "error": "policy_denied",
+                    "tool": name,
+                    "required_level": required_level.as_str(),
+                    "current_mode": self.policy.as_str(),
+                    "message": error,
+                }).to_string());
+            }
+        }
+        let result = self.call_inner(name, args);
+        if level >= RiskLevel::L2 {
+            match &result {
+                Ok(_) => self.audit(name, level, true, None),
+                Err(e) => self.audit(name, level, false, Some(e)),
+            }
+        }
+        result
+    }
+
+    fn call_inner(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         match name {
+            "policy_status" => Ok(json!({
+                "mode": self.policy.as_str(),
+                "caller": self.caller,
+                "levels": {
+                    "L0_read": ["hosts_list", "system_overview", "system_load", "process_list", "network_connections", "filesystems"],
+                    "L1_diagnose": ["host_use", "probe_status", "probe_search", "probe_poll"],
+                    "L2_recoverable": ["process_nice", "process_signal(非KILL且非tree)", "scheduler_set_limit", "scheduler_group_action(create)", "probe_attach", "probe_detach"],
+                    "L3_destructive": ["process_signal(KILL或tree)", "scheduler_group_action(delete)"],
+                },
+                "approval": "L3 在 confirm 模式下需 approval_token（由 system-monitor mcp-approve 签发，一次性、绑定参数）",
+                "audit": "~/.local/share/system-monitor/mcp-audit.jsonl",
+            })),
             "hosts_list" => {
                 let (saved, errs) = remote::load_hosts();
                 Ok(json!({
@@ -244,6 +315,15 @@ impl Server {
                     Some(h) => remote::set_nice(h, pid, nice)?,
                 }
                 Ok(json!({"host": host.as_ref().map(|t| t.as_str()).unwrap_or("local"), "pid": pid, "nice": nice}))
+            }
+            "scheduler_status" => {
+                // cgroup 调度体检：逐步报告委派/控制器/可写性，失败给修复建议
+                let checks = crate::cgroup::doctor();
+                Ok(json!({
+                    "host": "local",
+                    "ok": checks.iter().all(|c| c.ok),
+                    "checks": checks.iter().map(|c| json!({"name": c.name, "ok": c.ok, "detail": c.detail})).collect::<Vec<_>>(),
+                }))
             }
             "scheduler_groups" => {
                 let host = self.target(args)?;
@@ -572,6 +652,12 @@ fn local_signal(name: &str) -> Result<nix::sys::signal::Signal, String> {
 fn tools() -> Vec<Value> {
     vec![
         tool(
+            "policy_status",
+            "查看 MCP 策略：当前模式（readonly/confirm/trusted）、工具风险分级表、审批与审计说明。",
+            json!({}),
+            &[],
+        ),
+        tool(
             "hosts_list",
             "列出本地视角与 hosts.conf 中配置的 SSH 主机，以及当前选中的主机。",
             json!({}),
@@ -608,12 +694,13 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "process_signal",
-            "向进程发送信号（TERM/KILL/STOP/CONT/HUP/INT/USR1/USR2），可选结束整棵进程树。远端主机经 SSH 执行。",
+            "向进程发送信号（TERM/KILL/STOP/CONT/HUP/INT/USR1/USR2），可选结束整棵进程树。远端主机经 SSH 执行。KILL 或 tree=true 为 L3：confirm 模式需 approval_token。",
             json!({
                 "pid": {"type": "integer"},
                 "signal": {"type": "string"},
                 "tree": {"type": "boolean", "description": "true 时对进程树执行（仅 TERM/KILL 有意义）"},
                 "host": {"type": "string"},
+                "approval_token": {"type": "string", "description": "L3 一次性审批凭证（system-monitor mcp-approve 签发）"},
             }),
             &["pid"],
         ),
@@ -634,6 +721,12 @@ fn tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            "scheduler_status",
+            "本机 cgroup 调度体检：cgroup v2 / 委派 / 控制器 / 可写性逐项报告，失败附原因与修复建议。",
+            json!({}),
+            &[],
+        ),
+        tool(
             "scheduler_set_limit",
             "设置 cgroup 分组限额：cpu_max_pct（每核百分比，如 50）、cpu_weight（1-10000）、pids_max（null 表示不限）。",
             json!({
@@ -647,11 +740,12 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "scheduler_group_action",
-            "创建或删除 cgroup 调度分组。",
+            "创建或删除 cgroup 调度分组。delete 为 L3：confirm 模式需 approval_token。",
             json!({
                 "action": {"type": "string", "enum": ["create", "delete"]},
                 "name": {"type": "string"},
                 "host": {"type": "string"},
+                "approval_token": {"type": "string", "description": "L3 一次性审批凭证（system-monitor mcp-approve 签发）"},
             }),
             &["action", "name"],
         ),
@@ -706,7 +800,21 @@ fn tools() -> Vec<Value> {
     ]
 }
 
+/// 工具声明：注解（readOnlyHint/destructiveHint）由服务端分级表派生，
+/// 与 mcppolicy::risk_of 保持同源，不会出现注解放行、服务端拒绝的劈叉。
 fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
+    // 静态注解按工具名的基础分级；参数敏感（KILL/tree/delete）在服务端运行时升级
+    const READ_ONLY_TOOLS: &[&str] = &[
+        "hosts_list", "host_use", "system_overview", "system_load", "process_list",
+        "network_connections", "filesystems", "probe_status", "probe_search", "probe_poll",
+        "policy_status",
+    ];
+    let (read_only, destructive) = match name {
+        // 运行时按参数定级（KILL/tree/delete 会升级 L3），注解不给只读提示
+        "process_signal" | "scheduler_group_action" => (false, false),
+        n if READ_ONLY_TOOLS.contains(&n) => (true, false),
+        _ => (false, false),
+    };
     json!({
         "name": name,
         "description": desc,
@@ -714,6 +822,10 @@ fn tool(name: &str, desc: &str, props: Value, required: &[&str]) -> Value {
             "type": "object",
             "properties": props,
             "required": required,
+        },
+        "annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
         },
     })
 }
@@ -757,6 +869,20 @@ fn handle(server: &mut Server, msg: &Value) -> Option<Value> {
 
 pub fn run() -> std::io::Result<()> {
     let mut server = Server::new();
+    let argv: Vec<String> = std::env::args().collect();
+    let raw = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--mcp-policy=").map(String::from))
+        .or_else(|| std::env::var("SM_MCP_POLICY").ok());
+    if let Some(raw) = raw {
+        match PolicyMode::parse(&raw) {
+            Some(m) => server.policy = m,
+            None => {
+                eprintln!("system-monitor mcp: 非法策略值 \"{raw}\"（可选 readonly / confirm / trusted），拒绝启动");
+                std::process::exit(2);
+            }
+        }
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -835,6 +961,82 @@ mod tests {
         assert_eq!(signal_number("TERM").unwrap(), 15);
         assert_eq!(signal_number("kill").unwrap_err(), "不支持的信号：kill");
         assert_eq!(signal_number("KILL").unwrap(), 9);
+    }
+
+    #[test]
+    fn default_policy_is_readonly_and_blocks_writes() {
+        // 默认启动的 MCP 无法执行任何写操作：结构化拒绝 + 不触碰系统
+        let mut s = Server::new();
+        assert_eq!(s.policy, PolicyMode::Readonly, "默认必须是只读策略");
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"process_signal","arguments":{"pid":999999,"signal":"TERM"}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], true);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).expect("拒绝信息应为结构化 JSON");
+        assert_eq!(v["error"], "policy_denied");
+        assert_eq!(v["required_level"], "L2");
+        assert_eq!(v["current_mode"], "readonly");
+        // L3 同样拒绝;且 KILL 连审批提示都给出（若 confirm 模式）
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"process_signal","arguments":{"pid":999999,"signal":"KILL"}}}"#,
+        );
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["error"], "policy_denied");
+        assert_eq!(v["required_level"], "L3");
+        // 只读工具不受影响
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"system_load","arguments":{}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], false);
+    }
+
+    #[test]
+    fn trusted_mode_allows_and_unknown_policy_fails_closed() {
+        let mut s = Server::new();
+        s.policy = PolicyMode::Trusted;
+        // trusted 下对不存在 PID 发信号：策略放行，执行层报 gone（而非 policy_denied）
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"process_signal","arguments":{"pid":999999,"signal":"TERM"}}}"#,
+        );
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("policy_denied"), "trusted 应放行（执行层错误是另一回事）：{text}");
+        // 未知工具按 L3 处理（fail closed）
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"rm_rf_everything","arguments":{}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], true);
+    }
+
+    #[test]
+    fn tools_carry_policy_annotations() {
+        let mut s = Server::new();
+        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":15,"method":"tools/list"}"#);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let find = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
+        assert_eq!(find("system_overview")["annotations"]["readOnlyHint"], true);
+        assert_eq!(find("process_nice")["annotations"]["readOnlyHint"], false);
+        assert!(find("policy_status")["name"] == "policy_status");
+    }
+
+    #[test]
+    fn policy_status_reports_levels() {
+        let mut s = Server::new();
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"policy_status","arguments":{}}}"#,
+        );
+        assert_eq!(r["result"]["isError"], false);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["mode"], "readonly");
+        assert!(v["levels"]["L3_destructive"].is_array());
     }
 
     #[test]

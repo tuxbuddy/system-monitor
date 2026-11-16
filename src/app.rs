@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -215,9 +214,9 @@ pub struct CpuManagerApp {
     hosts: Vec<remote::SshTarget>,
     host_sel: Option<remote::SshTarget>,
     add_host: Option<String>,
-    remote_shared: Arc<Mutex<Option<remote::RemoteSample>>>,
+    remote_shared: Arc<Mutex<remote::RemoteSlot>>,
     remote_prev: Arc<Mutex<Option<remote::Counters>>>,
-    remote_busy: Arc<AtomicBool>,
+    remote_inflight: Arc<Mutex<bool>>,
     last_remote_kick: Instant,
     fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>>,
     fleet_hosts: Arc<Mutex<Vec<remote::SshTarget>>>,
@@ -251,6 +250,8 @@ pub struct CpuManagerApp {
     probe_armed_pid: Option<u32>,
     /// 历史写入失败的一次性报告（同错误不重复提示）。
     hist_err: Option<String>,
+    /// 调度熔断告警只提示一次，重新启用后复位。
+    sched_halt_warned: bool,
 }
 
 impl CpuManagerApp {
@@ -324,9 +325,9 @@ impl CpuManagerApp {
             hosts: hosts.clone(),
             host_sel: None,
             add_host: None,
-            remote_shared: Arc::new(Mutex::new(None)),
+            remote_shared: Arc::new(Mutex::new(remote::RemoteSlot::new())),
             remote_prev: Arc::new(Mutex::new(None)),
-            remote_busy: Arc::new(AtomicBool::new(false)),
+            remote_inflight: Arc::new(Mutex::new(false)),
             last_remote_kick: Instant::now(),
             fleet,
             fleet_hosts,
@@ -359,6 +360,7 @@ impl CpuManagerApp {
             probe_test_child: None,
             probe_armed_pid: None,
             hist_err: None,
+            sched_halt_warned: false,
         };
         app.saved_cfg = app.current_config();
         if let Some(w) = hosts_warn {
@@ -461,30 +463,60 @@ impl CpuManagerApp {
     }
 
     fn resample_remote(&mut self, target: &remote::SshTarget) {
-        let kick = self.last_remote_kick.elapsed() >= Duration::from_secs(2)
-            && !self.remote_busy.load(Ordering::Relaxed);
-        if kick {
-            self.remote_busy.store(true, Ordering::Relaxed);
+        // 代次化采样：槽绑定 host+generation，过期线程的回写被丢弃；
+        // 旧主机任务在途不阻塞新主机启动采样。
+        let key = target.as_str().to_string();
+        let mut ticket;
+        let mut need_kick = false;
+        if let Ok(mut slot) = self.remote_shared.lock() {
+            if slot.host != key {
+                ticket = slot.reset_for(&key);
+                need_kick = true; // 主机切换：立即启动采样，不等节流窗口
+            } else {
+                ticket = slot.generation;
+                let inflight = self.remote_inflight.lock().map(|g| *g).unwrap_or(false);
+                if self.last_remote_kick.elapsed() >= Duration::from_secs(2) && !inflight {
+                    need_kick = true;
+                }
+            }
+            if need_kick {
+                ticket = slot.reset_for(&key); // 递增代次作为本次回写凭证
+            }
+        } else {
+            ticket = 0;
+        }
+        if need_kick {
             self.last_remote_kick = Instant::now();
+            if let Ok(mut f) = self.remote_inflight.lock() {
+                *f = true;
+            }
             let shared = self.remote_shared.clone();
             let prev = self.remote_prev.clone();
-            let busy = self.remote_busy.clone();
+            let inflight = self.remote_inflight.clone();
             let t = target.clone();
+            let kick_key = key.clone();
             std::thread::spawn(move || {
                 let mut p = prev.lock().ok().and_then(|mut g| g.take());
                 let res = remote::collect(&t, &mut p);
                 if let Ok(mut g) = prev.lock() {
                     *g = p;
                 }
-                if res.is_some()
+                // 校验 host+generation 后写入；主机已切换则丢弃
+                if let Some(sample) = res
                     && let Ok(mut s) = shared.lock()
                 {
-                    *s = res;
+                    s.accept(&kick_key, ticket, sample);
                 }
-                busy.store(false, Ordering::Relaxed);
+                if let Ok(mut f) = inflight.lock() {
+                    *f = false;
+                }
             });
         }
-        let sample = self.remote_shared.lock().ok().and_then(|g| (*g).clone());
+        let sample = self
+            .remote_shared
+            .lock()
+            .ok()
+            .and_then(|s| s.current(&key).cloned());
         if let Some(s) = sample {
             self.usage = s.usage;
             self.pi = s.pi;
@@ -898,7 +930,7 @@ impl CpuManagerApp {
         self.net_conns.clear();
         self.cmdline_cache = None;
         if let Ok(mut s) = self.remote_shared.lock() {
-            *s = None;
+            s.sample = None; // 代次清零：任何在途回写都因 host 不匹配被丢弃
         }
         if let Ok(mut p) = self.remote_prev.lock() {
             *p = None;
@@ -967,14 +999,17 @@ impl CpuManagerApp {
         }
     }
 
-    fn apply_sched_action(&mut self, act: SchedAction) {
+    /// 执行调度动作并返回写入是否成功（供调度状态机 commit）。
+    fn apply_sched_action(&mut self, act: SchedAction) -> bool {
         let (group, pct, verb) = match act {
             SchedAction::Engage { group, pct } => (group, Some(pct), "自动节流"),
             SchedAction::Restore { group } => (group, None, "自动恢复"),
         };
         let res = self.mgr.as_ref().map(|m| m.set_cpu_max(&group, pct));
         let cap = pct.map(|p| format!(" → {p}%")).unwrap_or_default();
+        let ok = matches!(res, Some(Ok(())));
         self.finish_cg(res, format!("{verb}：分组 {group}{cap}"));
+        ok
     }
 
     fn current_config(&self) -> AppConfig {
@@ -1006,20 +1041,33 @@ impl CpuManagerApp {
         if !self.sched.enabled || self.mgr.is_none() || self.host_sel.is_some() {
             return;
         }
+        // 熔断告警：提示一次并保持停机，直到用户重新启用
+        if self.sched_state.halted {
+            if !self.sched_halt_warned {
+                self.sched_halt_warned = true;
+                self.status_error = true;
+                self.status = "自动调度已熔断：连续写入失败，已停止自动动作（可重新启用自动调度以重试）".to_string();
+            }
+            return;
+        }
         let snap = SchedSnapshot {
             temp_c: self.pi.temp_c,
             cpu_percent: self.usage.total_percent,
             throttled: self.pi.throttle.is_some_and(|t| t.any_current()),
             undervoltage: self.pi.throttle.is_some_and(|t| t.undervoltage),
         };
-        let actions = scheduler::evaluate(&self.sched, &snap, &mut self.sched_state, Instant::now());
+        let now = Instant::now();
+        // evaluate 为纯函数；状态只在执行器确认写入成功后 commit
+        let actions = scheduler::evaluate(&self.sched, &snap, &self.sched_state, now);
         for a in actions {
             let note = match &a {
                 SchedAction::Engage { group, pct } => format!("触发自动节流：分组 {group} → {pct}%"),
                 SchedAction::Restore { group } => format!("自动恢复：分组 {group} 解除限速"),
             };
-            self.apply_sched_action(a);
-            if !self.status_error {
+            let committed = a.clone();
+            let ok = self.apply_sched_action(a);
+            self.sched_state.commit(&committed, ok, Instant::now());
+            if ok {
                 notify("系统监视器 · 自动节流", &note);
             }
         }
@@ -2129,9 +2177,18 @@ impl CpuManagerApp {
                 ui.checkbox(&mut enabled, RichText::new("启用自动模式").size(12.5));
                 ui.label(RichText::new("仅做可逆的 CPU 上限收紧/放宽，不会杀进程").size(11.0).color(theme::TEXT_MUTED));
             });
-            self.sched.enabled = enabled;
+            if enabled != self.sched.enabled {
+                // 重新启用 = 人工解除熔断，状态机清零重试
+                self.sched.enabled = enabled;
+                if enabled {
+                    self.sched_state.reset();
+                    self.sched_halt_warned = false;
+                }
+            }
             let (st_text, st_color, reason) = if !self.sched.enabled {
                 ("未启用".to_string(), theme::TEXT_MUTED, None)
+            } else if self.sched_state.halted {
+                ("已熔断（连续写入失败）".to_string(), theme::DANGER, Some("关闭再开启自动模式可重试"))
             } else if self.sched.target_group.is_none() {
                 ("已启用，未选目标分组".to_string(), theme::DANGER, Some("请选择目标分组"))
             } else if self.sched_state.engaged {
