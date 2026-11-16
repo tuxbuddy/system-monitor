@@ -109,6 +109,7 @@ pub fn append_line_capped(path: &Path, line: &str, max_bytes: u64, keep: usize, 
 }
 
 /// 读取文件前 `max_bytes` 字节（文本文件兜底，防止把异常大文件整个读入内存）。
+#[allow(dead_code)] // 基础件：GUI/TUI 迁移大文件读取时复用
 pub fn read_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut f = File::open(path)?;
     let mut buf = Vec::new();

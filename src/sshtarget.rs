@@ -133,6 +133,7 @@ impl SshTarget {
     }
 
     /// 已知合法路径（内部常量/测试构造用）。
+    #[allow(dead_code)]
     pub fn new_unchecked(s: &str) -> Self {
         Self { raw: s.to_string() }
     }

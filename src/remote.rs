@@ -64,7 +64,8 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
-    /// 机器可读的错误码，供 UI/MCP 展示与分类。
+    /// 机器可读的错误码，供 UI/MCP 展示与分类（测试与后续结构化错误通道使用）。
+    #[allow(dead_code)]
     pub fn code(&self) -> &'static str {
         match self {
             Self::Spawn(_) => "spawn",
