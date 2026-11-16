@@ -51,6 +51,11 @@ pub struct ProcSnapshot {
     pub state: char,
     pub uid: u32,
     pub rss_kb: u64,
+    /// /proc/<pid>/stat 第 22 字段：进程启动时间（时钟滴答）。
+    /// 与 pid 一起构成进程实例身份，防止信号发给 PID 复用后的无关进程。
+    /// （信号路径直接读 /proc 比对；此字段供快照消费者使用）
+    #[allow(dead_code)]
+    pub starttime: u64,
     pub ppid: i32,
 }
 
@@ -510,6 +515,7 @@ pub fn parse_proc_stat(line: &str) -> Option<ProcSnapshot> {
         nice: rest[16].parse().ok()?,
         uid: 0,
         rss_kb: 0,
+        starttime: rest.get(19).and_then(|s| s.parse().ok()).unwrap_or(0),
         ppid: rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
     })
 }
@@ -909,7 +915,7 @@ mod tests {
     }
 
     fn proc(pid: i32, utime: u64, stime: u64) -> ProcSnapshot {
-        ProcSnapshot { pid, comm: format!("p{pid}"), utime, stime, nice: 0, state: 'S', uid: 1000, rss_kb: 0, ppid: 0 }
+        ProcSnapshot { pid, comm: format!("p{pid}"), utime, stime, nice: 0, state: 'S', uid: 1000, rss_kb: 0, starttime: 0, ppid: 0 }
     }
 
     #[test]

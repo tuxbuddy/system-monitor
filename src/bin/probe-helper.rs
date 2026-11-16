@@ -743,7 +743,11 @@ fn handle_client(mut stream: UnixStream, state: &Arc<Mutex<State>>, trace: &Trac
     }
 }
 
+/// 判定事件是否属于本工具：`sm<pid>_<seq>`（入口）与 `sm<pid>_<seq>ret`（返回）。
+/// 命名前缀归属校验保证只清理自己（历史会话）的事件，不误删其它工具的探针。
 fn is_our_event(name: &str) -> bool {
+    // 返回探针名以 ret 结尾，剥掉后按同一规则校验
+    let name = name.strip_suffix("ret").unwrap_or(name);
     let Some(rest) = name.strip_prefix("sm") else {
         return false;
     };
@@ -756,6 +760,8 @@ fn is_our_event(name: &str) -> bool {
         && seq.chars().all(|c| c.is_ascii_digit())
 }
 
+/// 启动时清理本工具的历史残留（崩溃/超时遗留）：入口 `p:` 与返回 `r:`
+/// 成对处理。清理幂等；失败仅记录不阻塞服务启动。
 fn cleanup_stale(trace: &Trace) {
     for kind in [Kind::Kprobe, Kind::Uprobe] {
         let path = trace.events_file(kind);
@@ -763,7 +769,8 @@ fn cleanup_stale(trace: &Trace) {
             continue;
         };
         for line in text.lines() {
-            let Some(rest) = line.strip_prefix("p:") else {
+            // 同时匹配入口 p: 与返回 r:；其余行（他人的、tracepoint）不动
+            let Some(rest) = line.strip_prefix("p:").or_else(|| line.strip_prefix("r:")) else {
                 continue;
             };
             let Some(token) = rest.split_whitespace().next() else {
@@ -890,5 +897,35 @@ mod tests {
         assert!(is_our_event("sm1234_7"));
         assert!(!is_our_event("sm1234_x"));
         assert!(!is_our_event("myprobe"));
+        // 返回探针（ret 后缀）必须识别，否则清理漏掉 r: 残留
+        assert!(is_our_event("sm1234_7ret"));
+        assert!(is_our_event("sm999_12ret"));
+        // 他人/伪装事件不认
+        assert!(!is_our_event("sm1234_7retx"));
+        assert!(!is_our_event("xsm1234_7"));
+        assert!(!is_our_event("sm1234ret"));
+        assert!(!is_our_event("sm1234_ret"));
+    }
+
+    #[test]
+    fn cleanup_stale_is_prefix_scoped() {
+        // 通过 CgReady 同款 from_output 风格验证:清理只作用于本工具前缀。
+        // is_our_event 覆盖已足够;这里额外验证 r:/p: 双前缀的行解析逻辑
+        let lines = [
+            "p:sm111_1 vfs_read",      // 本工具入口
+            "r:sm111_1ret vfs_read",   // 本工具返回
+            "p:other_probe vfs_write", // 他人探针
+            "p:sm222_2 do_sys_open",   // 另一会话入口
+            "r:sm222_2ret do_sys_open", // 另一会话返回
+        ];
+        let ours: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("p:").or_else(|| l.strip_prefix("r:"))?;
+                let token = rest.split_whitespace().next()?;
+                is_our_event(token).then_some(token)
+            })
+            .collect();
+        assert_eq!(ours, vec!["sm111_1", "sm111_1ret", "sm222_2", "sm222_2ret"]);
     }
 }

@@ -269,7 +269,23 @@ impl CgroupManager {
             Some(p) if p > 0 => pct_to_cpu_max(p),
             _ => "max 100000".to_string(),
         };
+        self.set_cpu_max_raw(name, &val)
+    }
+
+    /// 写原始 `cpu.max` 值（恢复限流前状态用，值来自对账记录）。
+    pub fn set_cpu_max_raw(&self, name: &str, val: &str) -> Result<(), CgError> {
+        if !valid_group_name(name) {
+            return Err(CgError::Invalid("非法分组名".into()));
+        }
         std::fs::write(self.group_path(name).join("cpu.max"), val).map_err(map_io)
+    }
+
+    /// 读当前 `cpu.max` 原文（对账基准；分组不存在返回 None）。
+    pub fn read_cpu_max(&self, name: &str) -> Option<String> {
+        if !valid_group_name(name) {
+            return None;
+        }
+        std::fs::read_to_string(self.group_path(name).join("cpu.max")).ok()
     }
 
     pub fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<(), CgError> {

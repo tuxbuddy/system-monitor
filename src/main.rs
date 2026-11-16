@@ -14,6 +14,7 @@ mod probe;
 mod probeclient;
 mod procstats;
 mod remote;
+mod schedstate;
 mod sshtarget;
 mod tui;
 #[cfg(feature = "gui")]
