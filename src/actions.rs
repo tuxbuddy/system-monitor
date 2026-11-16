@@ -46,16 +46,17 @@ const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
 
 #[cfg(target_os = "linux")]
 fn pidfd_supported() -> bool {
-    // 唯一可靠判定：对 init(1) 做 pidfd_open——init 恒存在，ENOSYS 即内核太老
-    let r = unsafe { libc::syscall(SYS_PIDFD_OPEN, 1, 0u32) };
-    if r >= 0 {
-        unsafe { libc::close(r as libc::c_int) };
-        true
-    } else {
-        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        // ENOSYS=不支持;EPERM/ESRCH 等说明系统调用存在
-        e != libc::ENOSYS
+    // 可靠判定：对 init(1) 完整走一遍 pidfd_open + pidfd_send_signal(sig=0 探测)
+    // ——init 恒存在；open 返回 fd 但 send 报 ENOSYS/EINVAL（某些容器/seccomp 环境
+    // 只放行 open）同样视为不支持，走 starttime 回退路径。
+    let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, 1, 0u32) };
+    if fd < 0 {
+        return false;
     }
+    let fd = fd as libc::c_int;
+    let r = unsafe { libc::syscall(SYS_PIDFD_SEND_SIGNAL, fd, 0, 0u64) };
+    unsafe { libc::close(fd) };
+    r == 0
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -85,7 +86,8 @@ fn pidfd_send(pid: i32, sig: i32) -> Result<(), ActionError> {
         Err(match err {
             libc::ESRCH => ActionError::Gone,
             libc::EPERM | libc::EACCES => ActionError::Permission,
-            libc::ENOSYS => ActionError::Unsupported("pidfd_send_signal 不可用".to_string()),
+            // ENOSYS/EINVAL：环境不支持（seccomp/兼容层），调用方回退 starttime 路径
+            libc::ENOSYS | libc::EINVAL => ActionError::Unsupported(format!("pidfd_send_signal errno {err}")),
             _ => ActionError::Other(format!("pidfd_send_signal errno {err}")),
         })
     }
@@ -127,7 +129,14 @@ pub fn send_signal_verified(pid: i32, sig: Signal, expected_starttime: Option<u6
         }
     }
     if pidfd_supported() {
-        return pidfd_send(pid, sig as i32);
+        match pidfd_send(pid, sig as i32) {
+            // Gone/Permission/成功都是确定结论；环境不支持才回退
+            Err(ActionError::Unsupported(e)) => {
+                // 落到下方 starttime 回退路径
+                let _ = e;
+            }
+            other => return other,
+        }
     }
     // 回退：发送前后 starttime 必须一致（窗口缩窄但不为零）
     let before = read_starttime(pid).ok_or(ActionError::Gone)?;
