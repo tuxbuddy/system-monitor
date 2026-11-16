@@ -270,18 +270,77 @@ fn check_own_process(pid: i32) -> Result<(), CgError> {
     Ok(())
 }
 
+/// 定位当前用户的委派子树根（只读：读 /proc/self/cgroup 与 cgroup.controllers）。
+fn delegated_root() -> Result<PathBuf, CgError> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").map_err(map_io)?;
+    let uid = unsafe { libc::getuid() };
+    let rel = parse_self_cgroup(&text, uid).ok_or(CgError::NotDelegated)?;
+    let root = PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
+    let ctrls = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
+    if !ctrls.split_whitespace().any(|c| c == "cpu") {
+        return Err(CgError::NotDelegated);
+    }
+    Ok(root)
+}
+
+/// 在给定容器目录枚举分组（纯读取：不创建目录、不写控制器文件）。
+fn list_groups_at(container: &Path) -> Result<Vec<GroupState>, CgError> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(container).map_err(map_io)?.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name == "default" {
+            continue;
+        }
+        let cpu_max_pct = std::fs::read_to_string(path.join("cpu.max"))
+            .ok()
+            .and_then(|t| parse_cpu_max(&t));
+        let cpu_weight = std::fs::read_to_string(path.join("cpu.weight"))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(100);
+        let pids_max = std::fs::read_to_string(path.join("pids.max")).ok().and_then(|t| {
+            let t = t.trim();
+            if t == "max" {
+                None
+            } else {
+                t.parse().ok()
+            }
+        });
+        let procs = std::fs::read_to_string(path.join("cgroup.procs"))
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        let throttle = std::fs::read_to_string(path.join("cpu.stat")).ok().map(|t| {
+            let c = parse_cpu_stat(&t);
+            (c.nr_periods, c.nr_throttled, c.throttled_usec)
+        });
+        out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs, throttle });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn list_groups_readonly_at(root: &Path) -> Result<Vec<GroupState>, CgError> {
+    let container = root.join("cm-sched");
+    if !container.exists() {
+        return Ok(Vec::new());
+    }
+    list_groups_at(&container)
+}
+
+/// 只读枚举调度分组：不改动 cgroup（尚未初始化时返回空列表，而不是创建 cm-sched）。
+pub fn list_groups_readonly() -> Result<Vec<GroupState>, CgError> {
+    list_groups_readonly_at(&delegated_root()?)
+}
+
 impl CgroupManager {
     /// 能力检测以「读回验证」为准：控制器确认启用、目标文件存在且可写才报告可用；
     /// 本次新建的容器在检测失败时清理，不留半初始化目录。
     pub fn detect() -> Result<Self, CgError> {
-        let text = std::fs::read_to_string("/proc/self/cgroup").map_err(map_io)?;
-        let uid = unsafe { libc::getuid() };
-        let rel = parse_self_cgroup(&text, uid).ok_or(CgError::NotDelegated)?;
-        let root = PathBuf::from("/sys/fs/cgroup").join(rel.to_string_lossy().trim_start_matches('/'));
-        let ctrls = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
-        if !ctrls.split_whitespace().any(|c| c == "cpu") {
-            return Err(CgError::NotDelegated);
-        }
+        let root = delegated_root()?;
         if !is_writable(&root) {
             return Err(CgError::Permission);
         }
@@ -451,42 +510,7 @@ impl CgroupManager {
     }
 
     pub fn list_groups(&self) -> Result<Vec<GroupState>, CgError> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir(&self.container).map_err(map_io)?.flatten() {
-            let path = e.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name == "default" {
-                continue;
-            }
-            let cpu_max_pct = std::fs::read_to_string(path.join("cpu.max"))
-                .ok()
-                .and_then(|t| parse_cpu_max(&t));
-            let cpu_weight = std::fs::read_to_string(path.join("cpu.weight"))
-                .ok()
-                .and_then(|t| t.trim().parse().ok())
-                .unwrap_or(100);
-            let pids_max = std::fs::read_to_string(path.join("pids.max")).ok().and_then(|t| {
-                let t = t.trim();
-                if t == "max" {
-                    None
-                } else {
-                    t.parse().ok()
-                }
-            });
-            let procs = std::fs::read_to_string(path.join("cgroup.procs"))
-                .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0);
-            let throttle = std::fs::read_to_string(path.join("cpu.stat")).ok().map(|t| {
-                let c = parse_cpu_stat(&t);
-                (c.nr_periods, c.nr_throttled, c.throttled_usec)
-            });
-            out.push(GroupState { name, cpu_max_pct, cpu_weight, pids_max, procs, throttle });
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        list_groups_at(&self.container)
     }
 }
 
@@ -521,6 +545,35 @@ mod tests {
         assert_eq!(pct_to_cpu_max(200), "200000 100000");
         assert_eq!(parse_cpu_max("200000 100000"), Some(200));
         assert_eq!(parse_cpu_max("max 100000"), None);
+    }
+
+    #[test]
+    fn readonly_listing_parses_groups_without_creating() {
+        let root = std::env::temp_dir().join(format!("sm-cg-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // 未初始化：空列表，且绝不创建 cm-sched
+        assert!(list_groups_readonly_at(&root).unwrap().is_empty());
+        assert!(!root.join("cm-sched").exists());
+
+        let c = root.join("cm-sched");
+        std::fs::create_dir_all(c.join("build")).unwrap();
+        std::fs::create_dir_all(c.join("default")).unwrap();
+        std::fs::write(c.join("build/cpu.max"), "50000 100000").unwrap();
+        std::fs::write(c.join("build/cpu.weight"), "200").unwrap();
+        std::fs::write(c.join("build/pids.max"), "max").unwrap();
+        std::fs::write(c.join("build/cgroup.procs"), "11\n22\n").unwrap();
+        std::fs::write(c.join("build/cpu.stat"), "nr_periods 10\nnr_throttled 2\nthrottled_usec 5000\n").unwrap();
+
+        let groups = list_groups_readonly_at(&root).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "build");
+        assert_eq!(groups[0].cpu_max_pct, Some(50));
+        assert_eq!(groups[0].cpu_weight, 200);
+        assert_eq!(groups[0].pids_max, None);
+        assert_eq!(groups[0].procs, 2);
+        assert_eq!(groups[0].throttle, Some((10, 2, 5000)));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

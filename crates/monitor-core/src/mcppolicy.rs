@@ -98,9 +98,10 @@ fn base_risk(tool: &str) -> RiskLevel {
     match tool {
         // L0 纯读取
         "hosts_list" | "system_overview" | "system_load" | "process_list" | "network_connections"
-        | "filesystems" | "process_details" => RiskLevel::L0,
-        // L1 诊断（只读连接 / 探针元数据）
-        "host_use" | "probe_status" | "probe_search" | "probe_poll" | "scheduler_status" | "psi_status" => RiskLevel::L1,
+        | "filesystems" | "process_details" | "host_capabilities" => RiskLevel::L0,
+        // L1 诊断（只读连接 / 探针元数据 / 分组枚举）
+        "host_use" | "probe_status" | "probe_search" | "probe_poll" | "scheduler_status"
+        | "scheduler_groups" | "psi_status" => RiskLevel::L1,
         // L2 可恢复控制
         "process_nice" | "scheduler_set_limit" | "probe_attach" | "probe_detach" => RiskLevel::L2,
         // L3 / 参数敏感
@@ -148,7 +149,8 @@ fn canonical_params(args: &Value) -> String {
     fn norm(v: &Value) -> Value {
         match v {
             Value::Object(m) => {
-                let mut keys: Vec<&String> = m.keys().collect();
+                // approval_token 是传输层凭证，不属于业务参数，否则签发与校验永远不一致
+                let mut keys: Vec<&String> = m.keys().filter(|k| k.as_str() != "approval_token").collect();
                 keys.sort();
                 let mut out = serde_json::Map::new();
                 for k in keys {
@@ -458,7 +460,9 @@ mod tests {
     #[test]
     fn risk_classification() {
         assert_eq!(risk_of("system_overview", &json!({})), RiskLevel::L0);
+        assert_eq!(risk_of("host_capabilities", &json!({})), RiskLevel::L0);
         assert_eq!(risk_of("probe_search", &json!({})), RiskLevel::L1);
+        assert_eq!(risk_of("scheduler_groups", &json!({})), RiskLevel::L1);
         assert_eq!(risk_of("process_nice", &json!({"pid": 1, "nice": 5})), RiskLevel::L2);
         assert_eq!(risk_of("process_signal", &args(42, "TERM", false)), RiskLevel::L2);
         assert_eq!(risk_of("process_signal", &args(42, "KILL", false)), RiskLevel::L3);
@@ -476,6 +480,8 @@ mod tests {
         assert!(matches!(d, Decision::Deny { .. }));
         // 只读与诊断放行
         assert!(matches!(check(PolicyMode::Readonly, "system_overview", &json!({}), None), Decision::Allow));
+        assert!(matches!(check(PolicyMode::Readonly, "host_capabilities", &json!({}), None), Decision::Allow));
+        assert!(matches!(check(PolicyMode::Readonly, "scheduler_groups", &json!({}), None), Decision::Allow));
         assert!(matches!(check(PolicyMode::Readonly, "host_use", &json!({"host": "x"}), None), Decision::Allow));
     }
 
@@ -518,6 +524,14 @@ mod tests {
         let ap2 = issue_approval("process_signal", &other, 60).unwrap();
         let err = consume_approval("process_signal", &a, &ap2.token).unwrap_err();
         assert!(err.contains("不匹配"), "{err}");
+        // 调用方回传 approval_token 时，传输字段不应破坏参数绑定
+        // （用不同 TTL 生成不同签名，避免与上面已消费的凭证同秒撞 token）
+        let ap3 = issue_approval("process_signal", &a, 120).unwrap();
+        let mut with_tok = a.clone();
+        with_tok["approval_token"] = json!(ap3.token);
+        if let Err(e) = consume_approval("process_signal", &with_tok, &ap3.token) {
+            panic!("带 approval_token 的调用应通过：{e}");
+        }
         // 过期拒绝
         let expired = Approval {
             token: {
@@ -540,6 +554,9 @@ mod tests {
         let b = json!({"signal": "KILL", "pid": 42});
         assert_eq!(canonical_params(&a), canonical_params(&b));
         assert_ne!(canonical_params(&a), canonical_params(&json!({"pid": 43, "signal": "KILL"})));
+        // 传输层凭证不参与参数绑定，否则签发（无 token）与校验（带 token）永远不一致
+        let with_token = json!({"pid": 42, "signal": "KILL", "approval_token": "v1.abc.1"});
+        assert_eq!(canonical_params(&a), canonical_params(&with_token));
     }
 
     #[test]

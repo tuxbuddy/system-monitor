@@ -820,6 +820,16 @@ pub fn cg_base(target: &SshTarget) -> Option<String> {
     ok.then_some(base)
 }
 
+/// 远端只读枚举用委派根：只要求目录存在，不要求可写。
+pub fn cg_base_readonly(target: &SshTarget) -> Option<String> {
+    let uid: u32 = ssh_sh(target, "id -u")?.trim().parse().ok()?;
+    let base = user_service_path(uid);
+    let ok = ssh_sh(target, &format!("[ -d '{base}' ] && echo OK"))
+        .map(|s| s.contains("OK"))
+        .unwrap_or(false);
+    ok.then_some(base)
+}
+
 /// 远端 cgroup 就绪结果：目录/控制器/可写性分别校验，失败有可区分错误码。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CgReady {

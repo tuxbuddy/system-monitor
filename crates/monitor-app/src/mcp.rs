@@ -531,12 +531,11 @@ impl Server {
                 let host = self.target(args)?;
                 match &host {
                     None => {
-                        let mgr = monitor_linux::cgroup::CgroupManager::detect().map_err(|e| e.to_string())?;
-                        let groups = mgr.list_groups().map_err(|e| e.to_string())?;
+                        let groups = monitor_linux::cgroup::list_groups_readonly().map_err(|e| e.to_string())?;
                         Ok(json!({"host": "local", "groups": groups_json(&groups)}))
                     }
                     Some(h) => {
-                        let base = remote::cg_base(h).ok_or_else(|| "该主机没有可写的用户 cgroup 委派根".to_string())?;
+                        let base = remote::cg_base_readonly(h).ok_or_else(|| "该主机没有用户 cgroup 委派根".to_string())?;
                         let groups = remote::cg_list(h, &base);
                         Ok(json!({"host": h.as_str(), "base": base, "groups": groups_json(&groups)}))
                     }
@@ -973,7 +972,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "scheduler_groups",
-            "列出 cgroup 调度分组（CPU 上限/权重、pids 上限、进程数）。远端主机要求存在可写的用户委派 cgroup。",
+            "只读列出 cgroup 调度分组（CPU 上限/权重、pids 上限、进程数），不会创建调度容器。远端主机要求存在用户委派 cgroup。",
             json!({"host": {"type": "string"}}),
             &[],
         ),
