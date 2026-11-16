@@ -644,15 +644,6 @@ impl CpuManagerApp {
         self.pi.remote.as_ref().map(|r| r.uid).unwrap_or(self.own_uid)
     }
 
-    fn remote_err(e: String) -> ActionError {
-        if e.contains("No such process") {
-            ActionError::Gone
-        } else if e.contains("Operation not permitted") || e.contains("Permission denied") {
-            ActionError::Permission
-        } else {
-            ActionError::Other(e)
-        }
-    }
 
     /// 暂停 / 恢复：远端主机走 SSH kill，本机走 nix。
     /// 提交后台远端操作（#15）：SSH 在 worker 执行，UI 立即返回不阻塞渲染。
@@ -677,14 +668,6 @@ impl CpuManagerApp {
             self.pending_ops = self.pending_ops.saturating_sub(1);
             match out {
                 UiJobOutcome::Report(r, msg) => self.report(r, msg),
-                UiJobOutcome::Remote(ok, msg) => {
-                    if ok {
-                        self.finish_remote(true, msg);
-                    } else {
-                        self.status_error = true;
-                        self.status = msg;
-                    }
-                }
                 UiJobOutcome::Cmdline(pid, c) => self.cmdline_cache = Some((pid, c)),
                 UiJobOutcome::Details(p, d) => self.details = Some((p, d)),
                 UiJobOutcome::Groups(g) => self.groups = g,
@@ -896,51 +879,13 @@ impl CpuManagerApp {
         }
     }
 
-    fn remote_cg_base_for(&mut self, host: &remote::SshTarget) -> Option<String> {
-        if let Some((h, b)) = &self.remote_cg_base
-            && h == host.as_str()
-        {
-            return Some(b.clone());
-        }
-        let base = remote::cg_base(host)?;
-        let ready = remote::cg_ensure(host, &base);
-        if !ready.ok {
-            self.status_error = true;
-            self.status = format!(
-                "远端调度容器未就绪（码 {:?}）：{}",
-                ready.error_code.unwrap_or(99),
-                ready.detail
-            );
-            return None;
-        }
-        self.remote_cg_base = Some((host.as_str().to_string(), base.clone()));
-        Some(base)
-    }
 
     /// 远端写调度就绪时返回 (host, base)。
-    fn cg_remote(&mut self) -> Option<(remote::SshTarget, String)> {
-        if !self.remote_write {
-            return None;
-        }
-        let h = self.host_sel.clone()?;
-        let b = self.remote_cg_base_for(&h)?;
-        Some((h, b))
-    }
 
     fn remote_write_host(&self) -> Option<remote::SshTarget> {
         if self.remote_write { self.host_sel.clone() } else { None }
     }
 
-    fn finish_remote(&mut self, ok: bool, ok_msg: String) {
-        if ok {
-            self.status_error = false;
-            self.status = ok_msg;
-            self.refresh_groups();
-        } else {
-            self.status_error = true;
-            self.status = "远程操作失败（主机/权限/委派 cgroup）".to_string();
-        }
-    }
 
     fn finish_cg(&mut self, res: Option<Result<(), cgroup::CgError>>, ok_msg: String) {
         match res {
