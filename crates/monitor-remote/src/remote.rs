@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::fsutil;
-use crate::pi::{self, GpuStats, PiStats, Power, RemoteInfo};
-use crate::procstats::{self, CpuTimes, FsUsage, NetConn, ProcDetails, ProcUsage, Usage};
-pub use crate::sshtarget::{HostsLineError, SshTarget, parse_hosts_checked};
+use monitor_core::fsutil;
+use monitor_linux::pi::{self, GpuStats, PiStats, Power, RemoteInfo};
+use monitor_linux::procstats::{self, CpuTimes, FsUsage, NetConn, ProcDetails, ProcUsage, Usage};
+pub use monitor_core::sshtarget::{HostsLineError, SshTarget, parse_hosts_checked};
 
 // ---- SSH 执行层：统一 deadline / 输出上限 / 取消 ----
 
@@ -697,7 +697,7 @@ pub fn summary(target: &SshTarget, prev: &mut Option<Counters>) -> FleetSummary 
 // ---- 远端 cgroup（写操作，仅在用户显式允许时调用）----
 // 只作用于该主机上「当前用户」的分组；所有名字经白名单校验，路径来自远端 /proc，均做基本转义校验。
 
-use crate::cgroup::{self, GroupState};
+use monitor_linux::cgroup::{self, GroupState};
 
 fn ssh_sh(target: &SshTarget, script: &str) -> Option<String> {
     let out = ssh_exec(target, script, &ExecLimits::default(), None).ok()?;

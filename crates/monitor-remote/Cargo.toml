@@ -1,0 +1,11 @@
+[package]
+name = "monitor-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSH 远端采集与控制：统一 ssh_exec（deadline/取消/输出上限）"
+
+[dependencies]
+monitor-core = { path = "../monitor-core" }
+monitor-linux = { path = "../monitor-linux" }
+serde_json = { workspace = true }

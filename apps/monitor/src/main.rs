@@ -1,30 +1,10 @@
-// 纯 TUI 构建复用同一数据层，只用到其中一部分（cgroup / 网络连接 / 文件系统等留给 GUI 版），
-// 因此非 gui 构建允许共享模块中暂未被 TUI 引用的条目。
-#![cfg_attr(not(feature = "gui"), allow(dead_code))]
+// 入口 bin：TUI / GUI / MCP / mcp-approve / ebpf-doctor 模式选择。
+// 数据层与前端在 workspace crates（monitor-core/linux/remote/app）。
 
-mod actions;
-mod caps;
-mod cgroup;
-mod config;
-mod fsutil;
-mod mcp;
-mod mcppolicy;
-mod pi;
-mod platform;
-mod psi;
-mod probe;
-mod probeclient;
-mod procstats;
-mod remote;
-mod schedstate;
-mod sshtarget;
-mod tui;
 #[cfg(feature = "gui")]
-mod app;
-#[cfg(feature = "gui")]
-mod scheduler;
-#[cfg(feature = "gui")]
-mod theme;
+use monitor_app::app;
+use monitor_app::{mcp, tui};
+use monitor_core::mcppolicy;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +34,29 @@ fn main() {
     } else {
         gui_main();
     }
+}
+
+fn print_help() {
+    println!(
+        "system-monitor {}\n\
+         用法：system-monitor [--tui | mcp]\n\
+         \n\
+         --tui, --headless  终端界面（无图形环境时自动启用）\n\
+         mcp, --mcp         以 MCP 服务运行（stdio，JSON-RPC；默认只读策略,\n\
+                            可用 --mcp-policy=confirm|trusted 提升，L3 需审批凭证）\n\
+         mcp-approve        签发 MCP L3 动作的一次性审批凭证（带外审批）\n\
+         -h, --help         显示本帮助\n\
+         \n\
+         图形版需要桌面会话（Wayland/X11）；本编译{}图形界面。\n\
+         MCP 工具：hosts_list / host_use / system_overview / system_load /\n\
+         process_list / process_signal / process_nice / process_details /\n\
+         scheduler_groups / scheduler_set_limit / scheduler_group_action /\n\
+         scheduler_status / host_capabilities / psi_status /\n\
+         network_connections / filesystems / probe_status / probe_search /\n\
+         probe_attach / probe_poll / probe_detach / policy_status",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(feature = "gui") { "包含" } else { "未包含" }
+    );
 }
 
 /// 签发 MCP L3 动作的一次性审批凭证（带外：由人在本机执行，token 转交给 AI 会话）。
@@ -119,26 +122,6 @@ fn print_approve_usage() {
     eprintln!(
         "用法：system-monitor mcp-approve --tool <工具名> --args '<参数JSON>' --ttl <秒>\n\
          示例：system-monitor mcp-approve --tool process_signal --args '{{\"pid\":123,\"signal\":\"KILL\"}}' --ttl 60"
-    );
-}
-
-fn print_help() {
-    println!(
-        "system-monitor {}\n\
-         用法：system-monitor [--tui | mcp]\n\
-         \n\
-         --tui, --headless  终端界面（无图形环境时自动启用）\n\
-         mcp, --mcp         以 MCP 服务运行（stdio，JSON-RPC）\n\
-         -h, --help         显示本帮助\n\
-         \n\
-         图形版需要桌面会话（Wayland/X11）；本编译{}图形界面。\n\
-         MCP 工具：hosts_list / host_use / system_overview / system_load /\n\
-         process_list / process_signal / process_nice /\n\
-         scheduler_groups / scheduler_set_limit / scheduler_group_action /\n\
-         network_connections / filesystems / probe_status / probe_search /\n\
-         probe_attach / probe_poll / probe_detach",
-        env!("CARGO_PKG_VERSION"),
-        if cfg!(feature = "gui") { "包含" } else { "未包含" }
     );
 }
 

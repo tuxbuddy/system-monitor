@@ -41,7 +41,7 @@ impl AppliedAction {
     /// 我们写入的 `cpu.max` 应该长什么样（对账基准）。
     pub fn applied_cpu_max(&self) -> String {
         match self.applied_pct {
-            Some(p) => crate::cgroup::pct_to_cpu_max(p),
+            Some(p) => crate::cgparse::pct_to_cpu_max(p),
             None => "max 100000".to_string(),
         }
     }

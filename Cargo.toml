@@ -1,31 +1,22 @@
-[package]
-name = "system-monitor"
+[workspace]
+resolver = "2"
+members = [
+    "crates/monitor-core",
+    "crates/monitor-linux",
+    "crates/monitor-remote",
+    "apps/monitor",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Linux 系统诊断与控制工具：本地/远端采集、cgroup 调度、内核探针、MCP 服务"
 repository = "https://github.com/tuxbuddy/system-monitor"
 
-[features]
-default = ["gui", "probe-helper"]
-gui = ["dep:eframe", "dep:egui_extras"]
-# probe-helper 仅 Linux 有意义（SO_PEERCRED/tracefs）；feature 门控让
-# 非 Linux 平台（macOS 开发机）--no-default-features 时跳过该 bin
-probe-helper = []
-
-[[bin]]
-name = "probe-helper"
-path = "src/bin/probe-helper.rs"
-required-features = ["probe-helper"]
-
-[[bench]]
-name = "parse"
-harness = false
-
-[dependencies]
-eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
-egui_extras = { version = "0.37", optional = true }
+[workspace.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "user"] }
-ratatui = "0.29"
 serde_json = "1"
+
+[profile.bench]
+debug = false

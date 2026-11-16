@@ -1,0 +1,34 @@
+[package]
+name = "system-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux 系统诊断与控制工具：本地/远端采集、cgroup 调度、内核探针、MCP 服务"
+repository.workspace = true
+
+[features]
+default = ["gui", "probe-helper"]
+gui = ["monitor-app/gui", "dep:eframe"]
+probe-helper = []
+
+[[bin]]
+name = "system-monitor"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe-helper"
+path = "src/bin/probe-helper.rs"
+required-features = ["probe-helper"]
+
+[[bench]]
+name = "parse"
+harness = false
+
+[dependencies]
+serde_json = { workspace = true }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+libc = { workspace = true }
+monitor-app = { path = "../../crates/monitor-app" }
+monitor-core = { path = "../../crates/monitor-core" }
+monitor-linux = { path = "../../crates/monitor-linux" }
+monitor-remote = { path = "../../crates/monitor-remote" }

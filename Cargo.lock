@@ -1369,6 +1369,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "monitor-app"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui_extras",
+ "libc",
+ "monitor-core",
+ "monitor-linux",
+ "monitor-remote",
+ "nix",
+ "ratatui",
+ "serde_json",
+]
+
+[[package]]
+name = "monitor-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "monitor-linux"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "monitor-core",
+ "nix",
+ "serde_json",
+]
+
+[[package]]
+name = "monitor-remote"
+version = "0.1.0"
+dependencies = [
+ "monitor-core",
+ "monitor-linux",
+ "serde_json",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2490,10 +2531,11 @@ name = "system-monitor"
 version = "0.1.0"
 dependencies = [
  "eframe",
- "egui_extras",
  "libc",
- "nix",
- "ratatui",
+ "monitor-app",
+ "monitor-core",
+ "monitor-linux",
+ "monitor-remote",
  "serde_json",
 ]
 
