@@ -1093,6 +1093,8 @@ mod tests {
 
     #[test]
     fn script_runs_locally() {
+        // 最小容器(fedora/debian 镜像)没有 ps;脚本与解析仍需可用
+        let has_ps = Command::new("ps").arg("--version").output().is_ok();
         let Ok(out) = Command::new("sh").arg("-c").arg(SCRIPT).output() else {
             return;
         };
@@ -1103,7 +1105,9 @@ mod tests {
         let r = parse_output(&String::from_utf8_lossy(&out.stdout), &mut prev);
         assert!(r.is_some(), "本机脚本输出应可解析");
         let s = r.unwrap();
-        assert!(!s.usage.procs.is_empty(), "应解析到进程列表");
+        if has_ps {
+            assert!(!s.usage.procs.is_empty(), "应解析到进程列表");
+        }
         assert!(s.pi.remote.is_some(), "本机也应能读出 os-release");
     }
 
