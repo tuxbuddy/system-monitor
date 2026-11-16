@@ -2032,9 +2032,14 @@ impl CpuManagerApp {
                 }
                 ui.add_space(4.0);
                 if self.view == View::Monitor {
-                    let (dash_label, dash_color) = if self.dash_open { ("收起大盘", theme::TEXT_SEC) } else { ("展开大盘", theme::CPU) };
-                    if action_btn(ui, dash_label, dash_color, true, false) {
-                        self.dash_open = !self.dash_open;
+                    if ui.ctx().content_rect().height() < 700.0 {
+                        ui.label(RichText::new("大盘已自动收起").size(10.5).color(theme::TEXT_MUTED))
+                            .on_hover_text("窗口高度不足 700 时自动收起，放大窗口即可展开");
+                    } else {
+                        let (dash_label, dash_color) = if self.dash_open { ("收起大盘", theme::TEXT_SEC) } else { ("展开大盘", theme::CPU) };
+                        if action_btn(ui, dash_label, dash_color, true, false) {
+                            self.dash_open = !self.dash_open;
+                        }
                     }
                 }
             });
@@ -3366,6 +3371,31 @@ impl CpuManagerApp {
                     chart(ui, ChartSpec { title: "读取", value: &disk_r_value, unit: " KB/s", color: theme::INFO, max: None, threshold: None, data: &self.perf.disk_r, window: self.chart_window }, h);
                     chart(ui, ChartSpec { title: "写入", value: &disk_w_value, unit: " KB/s", color: theme::WARNING, max: None, threshold: None, data: &self.perf.disk_w, window: self.chart_window }, h);
                 });
+                let fss = self.filesystems.clone();
+                dash_card(ui, "文件系统", theme::INFO, |ui| {
+                    if fss.is_empty() {
+                        ui.label(RichText::new("—（无块设备挂载）").size(12.0).color(theme::TEXT_MUTED));
+                    }
+                    for fs in &fss {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} · {}", fs.mount, fs.source)).size(11.5).monospace().color(theme::TEXT_SEC));
+                            let w = (ui.available_width() - 140.0).max(80.0);
+                            ui.add(
+                                egui::ProgressBar::new(fs.used_frac())
+                                    .desired_width(w)
+                                    .desired_height(6.0)
+                                    .fill(theme::heat_color(fs.used_frac()))
+                                    .corner_radius(3),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.1}/{:.1} GB", fs.used_kb() as f64 / 1048576.0, fs.total_kb as f64 / 1048576.0))
+                                    .size(10.5)
+                                    .monospace()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        });
+                    }
+                });
             };
             if ui.available_width() >= 760.0 {
                 ui.columns(2, |cols| {
@@ -3376,32 +3406,6 @@ impl CpuManagerApp {
                 left(ui);
                 right(ui);
             }
-
-            let fss = self.filesystems.clone();
-            dash_card(ui, "文件系统", theme::INFO, |ui| {
-                if fss.is_empty() {
-                    ui.label(RichText::new("—（无块设备挂载）").size(12.0).color(theme::TEXT_MUTED));
-                }
-                for fs in &fss {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} · {}", fs.mount, fs.source)).size(11.5).monospace().color(theme::TEXT_SEC));
-                        let w = (ui.available_width() - 140.0).max(80.0);
-                        ui.add(
-                            egui::ProgressBar::new(fs.used_frac())
-                                .desired_width(w)
-                                .desired_height(6.0)
-                                .fill(theme::heat_color(fs.used_frac()))
-                                .corner_radius(3),
-                        );
-                        ui.label(
-                            RichText::new(format!("{:.1}/{:.1} GB", fs.used_kb() as f64 / 1048576.0, fs.total_kb as f64 / 1048576.0))
-                                .size(10.5)
-                                .monospace()
-                                .color(theme::TEXT_MUTED),
-                        );
-                    });
-                }
-            });
         });
     }
 
@@ -5167,25 +5171,26 @@ fn sparkline_of(
         let y = rect.bottom() - 3.0 - (height - 6.0) * f;
         painter.line_segment([Pos2::new(rect.left() + 4.0, y), Pos2::new(rect.right() - 4.0, y)], Stroke::new(1.0, theme::BORDER));
     }
-    let n = data.len();
+    let series: Vec<f32> = data.iter().skip(data.len().saturating_sub(span.max(2))).copied().collect();
+    let n = series.len();
     if n < 2 {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "采集中…",
-            egui::FontId::proportional(10.0),
+            egui::FontId::proportional(10.5),
             theme::TEXT_MUTED,
         );
         return;
     }
-    // 采样点从右往左按固定间距排列：历史不足时不会拉成一条横跨整卡的斜线。
+    // 采样点从右往左按固定间距排列：只画最近 span 个采样，避免旧点越出卡片。
     let step = ((width - 8.0) / (span.max(2) - 1) as f32).max(0.5);
-    let pts: Vec<Pos2> = data
+    let pts: Vec<Pos2> = series
         .iter()
         .enumerate()
         .map(|(i, v)| {
             let x = rect.right() - 4.0 - (n as f32 - 1.0 - i as f32) * step;
-            let y = rect.bottom() - 3.0 - (height - 6.0) * (v / max).clamp(0.0, 1.0);
+            let y = rect.bottom() - 3.0 - (height - 6.0) * (*v / max).clamp(0.0, 1.0);
             Pos2::new(x, y)
         })
         .collect();
