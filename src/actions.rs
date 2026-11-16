@@ -109,6 +109,7 @@ pub fn read_starttime(pid: i32) -> Option<u64> {
 /// 带身份校验的信号发送：
 /// 1. pidfd 可用 → pidfd_open 绑定实例后发信号（杜绝 PID 复用）；
 /// 2. pidfd 不可用 → 对比发送前后的 starttime，变化即拒绝。
+///
 /// `expected_starttime` 非零时先比对（进程树操作传入采集时的值）。
 pub fn send_signal_verified(pid: i32, sig: Signal, expected_starttime: Option<u64>) -> Result<(), ActionError> {
     if pid <= 1 {
