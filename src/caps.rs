@@ -135,12 +135,17 @@ pub fn detect_local() -> HostCapabilities {
     });
 
     // kprobe_events 可写
-    let kp_w = std::path::Path::new("/sys/kernel/tracing/kprobe_events").exists()
-        && unsafe {
-            // access(W_OK) 需要真实权限判断；以 CString 调用
-            let c = std::ffi::CString::new("/sys/kernel/tracing/kprobe_events").unwrap();
-            libc::access(c.as_ptr(), libc::W_OK) == 0
-        };
+    let kp_w = {
+        let p = std::path::Path::new("/sys/kernel/tracing/kprobe_events")
+            .exists()
+            .then(|| unsafe {
+                // access(W_OK) 需要真实权限判断；以 CString 调用
+                let c = std::ffi::CString::new("/sys/kernel/tracing/kprobe_events").unwrap();
+                libc::access(c.as_ptr(), libc::W_OK) == 0
+            })
+            .unwrap_or(false);
+        p
+    };
     items.push(CapItem {
         name: "kprobe_events_writable",
         ok: kp_w,

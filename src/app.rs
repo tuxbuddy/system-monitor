@@ -644,6 +644,15 @@ impl CpuManagerApp {
         self.pi.remote.as_ref().map(|r| r.uid).unwrap_or(self.own_uid)
     }
 
+    fn remote_err(e: String) -> ActionError {
+        if e.contains("No such process") {
+            ActionError::Gone
+        } else if e.contains("Operation not permitted") || e.contains("Permission denied") {
+            ActionError::Permission
+        } else {
+            ActionError::Other(e)
+        }
+    }
 
     /// 暂停 / 恢复：远端主机走 SSH kill，本机走 nix。
     /// 提交后台远端操作（#15）：SSH 在 worker 执行，UI 立即返回不阻塞渲染。
@@ -660,10 +669,22 @@ impl CpuManagerApp {
 
     /// 每帧轮询后台结果并回填状态；结果按提交顺序应用。
     fn poll_jobs(&mut self) {
-        while let Ok(out) = self.job_rx.try_recv() {
+        loop {
+            let out = match self.job_rx.try_recv() {
+                Ok(o) => o,
+                Err(_) => break,
+            };
             self.pending_ops = self.pending_ops.saturating_sub(1);
             match out {
                 UiJobOutcome::Report(r, msg) => self.report(r, msg),
+                UiJobOutcome::Remote(ok, msg) => {
+                    if ok {
+                        self.finish_remote(true, msg);
+                    } else {
+                        self.status_error = true;
+                        self.status = msg;
+                    }
+                }
                 UiJobOutcome::Cmdline(pid, c) => self.cmdline_cache = Some((pid, c)),
                 UiJobOutcome::Details(p, d) => self.details = Some((p, d)),
                 UiJobOutcome::Groups(g) => self.groups = g,
@@ -700,7 +721,7 @@ impl CpuManagerApp {
             Some(h) => {
                 let sig = if stopped { libc::SIGCONT } else { libc::SIGSTOP };
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::signal(&h, pid, sig).map_err(ActionError::Other),
+                    remote::signal(&h, pid, sig).map_err(|e| ActionError::Other(e)),
                     msg,
                 ));
                 self.status_error = false;
@@ -720,7 +741,7 @@ impl CpuManagerApp {
             Some(h) => {
                 let s = sig as i32;
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::signal(&h, pid, s).map_err(ActionError::Other),
+                    remote::signal(&h, pid, s).map_err(|e| ActionError::Other(e)),
                     msg,
                 ));
                 self.status_error = false;
@@ -783,7 +804,7 @@ impl CpuManagerApp {
         match self.host_sel.clone() {
             Some(h) => {
                 self.spawn_job(move || UiJobOutcome::Report(
-                    remote::set_nice(&h, pid, value).map_err(ActionError::Other),
+                    remote::set_nice(&h, pid, value).map_err(|e| ActionError::Other(e)),
                     msg,
                 ));
                 self.status_error = false;
@@ -875,10 +896,51 @@ impl CpuManagerApp {
         }
     }
 
+    fn remote_cg_base_for(&mut self, host: &remote::SshTarget) -> Option<String> {
+        if let Some((h, b)) = &self.remote_cg_base
+            && h == host.as_str()
+        {
+            return Some(b.clone());
+        }
+        let base = remote::cg_base(host)?;
+        let ready = remote::cg_ensure(host, &base);
+        if !ready.ok {
+            self.status_error = true;
+            self.status = format!(
+                "远端调度容器未就绪（码 {:?}）：{}",
+                ready.error_code.unwrap_or(99),
+                ready.detail
+            );
+            return None;
+        }
+        self.remote_cg_base = Some((host.as_str().to_string(), base.clone()));
+        Some(base)
+    }
+
+    /// 远端写调度就绪时返回 (host, base)。
+    fn cg_remote(&mut self) -> Option<(remote::SshTarget, String)> {
+        if !self.remote_write {
+            return None;
+        }
+        let h = self.host_sel.clone()?;
+        let b = self.remote_cg_base_for(&h)?;
+        Some((h, b))
+    }
+
     fn remote_write_host(&self) -> Option<remote::SshTarget> {
         if self.remote_write { self.host_sel.clone() } else { None }
     }
 
+    fn finish_remote(&mut self, ok: bool, ok_msg: String) {
+        if ok {
+            self.status_error = false;
+            self.status = ok_msg;
+            self.refresh_groups();
+        } else {
+            self.status_error = true;
+            self.status = "远程操作失败（主机/权限/委派 cgroup）".to_string();
+        }
+    }
 
     fn finish_cg(&mut self, res: Option<Result<(), cgroup::CgError>>, ok_msg: String) {
         match res {
@@ -2661,6 +2723,18 @@ impl CpuManagerApp {
                 Some(s) => (s.ok, s.os.clone(), s.cpu, s.mem, s.temp, s.gpu, s.load1, s.procs),
                 None => (false, String::new(), 0.0, 0.0, 0.0, 0.0, 0.0, 0),
             };
+            // 失败主机在 os 列显示原因与上次成功时间,不显示假 0
+            let os = match fleet.get(key).and_then(|s| s.last_error.clone()) {
+                Some(err) => {
+                    let age = fleet
+                        .get(key)
+                        .and_then(|s| s.last_ok_at_unix)
+                        .map(|t| format!("（{} 秒前数据）", unix_now() - t))
+                        .unwrap_or_else(|| "（从未成功）".to_string());
+                    format!("⚠ {err} {age}")
+                }
+                None => os,
+            };
             rows.push((Some(key.to_string()), key.to_string(), os, ok, cpu, mem, temp, gpu, load, procs));
         }
 
@@ -4065,6 +4139,13 @@ fn probe_payload(line: &str) -> String {
     line.trim().to_string()
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn format_age(secs: f32) -> String {
     if secs < 60.0 {
         format!("{:.0} 秒", secs)
@@ -4084,29 +4165,90 @@ fn helper_install_hint() -> String {
         .unwrap_or_else(|| "sudo scripts/install-probe-helper.sh".to_string())
 }
 
+/// fleet 轮询并发上限：超过该数的主机排队下一批，线程数有界（#21）。
+pub const FLEET_WORKERS: usize = 4;
+/// 离线主机退避：连续失败 N 次后探测间隔 ×（1+min(n,5)）秒抖动上限（#22）。
+const BACKOFF_BASE_SECS: u64 = 5;
+
 fn start_fleet_poller(
     fleet: Arc<Mutex<HashMap<String, remote::FleetSummary>>>,
     hosts: Arc<Mutex<Vec<remote::SshTarget>>>,
 ) {
     std::thread::spawn(move || {
         let mut prev: HashMap<String, Option<remote::Counters>> = HashMap::new();
+        let mut failures: HashMap<String, u32> = HashMap::new();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, remote::FleetSummary, Option<remote::Counters>)>();
+        let mut round = 0u64;
         loop {
+            round += 1;
             let round_start = Instant::now();
             let list = hosts.lock().map(|h| h.clone()).unwrap_or_default();
+            // 有界 worker 池：快主机不被慢主机拖住，总线程数恒为 FLEET_WORKERS。
+            // mpsc Receiver 不可克隆 → Arc<Mutex<>> 共享消费队列。
+            let (wtx, wrx) = std::sync::mpsc::channel::<remote::SshTarget>();
+            let wrx = std::sync::Arc::new(std::sync::Mutex::new(wrx));
+            let mut workers = Vec::new();
+            for _ in 0..FLEET_WORKERS {
+                let wrx = wrx.clone();
+                let tx = tx.clone();
+                workers.push(std::thread::spawn(move || loop {
+                    let job = wrx.lock().ok().and_then(|r| r.recv().ok());
+                    let Some(target) = job else { break };
+                    let key = target.as_str().to_string();
+                    let mut p = None;
+                    let s = remote::summary(&target, &mut p);
+                    let _ = tx.send((key, s, p));
+                }));
+            }
+            // 分发：离线主机按退避跳过本轮（不拖慢在线主机）
+            let mut dispatched = 0usize;
             for target in list {
                 let key = target.as_str().to_string();
-                let mut p = prev.remove(&key).flatten();
-                // 每台主机独立 10s deadline：一台挂住不会拖住整轮
-                let s = remote::summary(&target, &mut p);
+                let fail_n = failures.get(&key).copied().unwrap_or(0);
+                // 退避：连续失败越多，探测越稀疏（每失败 ×1 轮跳过，上限 5 轮）
+                if fail_n > 0 && round % u64::from(fail_n.min(5) + 1) != 0 {
+                    continue;
+                }
+                let _ = wtx.send(target);
+                dispatched += 1;
+            }
+            drop(wtx); // 关闭分发，worker 消费完自然退出
+            // 回收本轮结果；prev 缓存按主机归位
+            for _ in 0..dispatched {
+                let Ok((key, s, p)) = rx.recv_timeout(Duration::from_secs(30)) else {
+                    break;
+                };
                 prev.insert(key.clone(), p);
+                failures.insert(key.clone(), if s.ok { 0 } else { s.consecutive_failures });
                 if let Ok(mut f) = fleet.lock() {
+                    // 失败时保留上次成功数据（UI 显示 last_ok_at 与错误），不清零
+                    if !s.ok
+                        && let Some(old) = f.get(&key)
+                        && old.ok
+                    {
+                        let mut merged = s.clone();
+                        merged.last_ok_at_unix = old.last_ok_at_unix;
+                        merged.cpu = old.cpu;
+                        merged.mem = old.mem;
+                        merged.temp = old.temp;
+                        merged.gpu = old.gpu;
+                        merged.load1 = old.load1;
+                        merged.procs = old.procs;
+                        merged.os = old.os.clone();
+                        f.insert(key, merged);
+                        continue;
+                    }
                     f.insert(key, s);
                 }
             }
-            // 下一轮 = 本轮开始 + 5s，避免串行 SSH 耗时造成刷新周期漂移
+            // 回收 worker(队列已空,全部即刻退出),线程数不跨轮累积
+            for w in workers {
+                let _ = w.join();
+            }
+            // 轮间小睡：round_start+5s 起算,退避主机由下轮分发逻辑自然稀释
             let spent = round_start.elapsed();
-            if spent < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_secs(5) - spent);
+            if spent < Duration::from_secs(BACKOFF_BASE_SECS) {
+                std::thread::sleep(Duration::from_secs(BACKOFF_BASE_SECS) - spent);
             }
         }
     });

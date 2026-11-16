@@ -7,8 +7,20 @@ description = "Linux 系统诊断与控制工具：本地/远端采集、cgroup 
 repository = "https://github.com/tuxbuddy/system-monitor"
 
 [features]
-default = ["gui"]
+default = ["gui", "probe-helper"]
 gui = ["dep:eframe", "dep:egui_extras"]
+# probe-helper 仅 Linux 有意义（SO_PEERCRED/tracefs）；feature 门控让
+# 非 Linux 平台（macOS 开发机）--no-default-features 时跳过该 bin
+probe-helper = []
+
+[[bin]]
+name = "probe-helper"
+path = "src/bin/probe-helper.rs"
+required-features = ["probe-helper"]
+
+[[bench]]
+name = "parse"
+harness = false
 
 [dependencies]
 eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }

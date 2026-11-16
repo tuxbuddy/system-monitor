@@ -70,6 +70,43 @@ jobs:
       - name: 测试（纯 TUI）
         run: cargo test --no-default-features --bin system-monitor
 
+  # 发行版测试矩阵（#23）：每个容器跑纯 TUI 测试（无 GUI 系统库依赖），
+  # 覆盖 libc/内核差异面。特权 helper 与 cgroup/PSI 场景需 VM,在 docs 记录为未验证项。
+  distro-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            image: ubuntu:22.04
+            install: apt-get update && apt-get install -y curl build-essential
+          - name: debian-12
+            image: debian:12
+            install: apt-get update && apt-get install -y curl build-essential
+          - name: fedora-41
+            image: fedora:41
+            install: dnf install -y curl gcc clang
+          - name: archlinux
+            image: archlinux:base
+            install: pacman -Syu --noconfirm curl base-devel
+    name: test-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装工具链依赖
+        run: ${{ matrix.install }}
+      - name: 测试（纯 TUI）
+        run: cargo test --no-default-features --bin system-monitor
+      - name: 记录矩阵结果
+        run: echo "distro=${{ matrix.name }} kernel=$(uname -r) result=pass" | tee -a distro-matrix.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.name }}
+          path: distro-matrix.txt
+
   build:
     needs: [test, audit]
     strategy:
@@ -143,6 +180,21 @@ jobs:
             system-monitor-${{ matrix.name }}.tar.gz
             system-monitor-${{ matrix.name }}.sha256
           if-no-files-found: error
+
+  # 性能基准（#24）：核心解析路径 criterion 基准,结果作为工件保存供人工对比
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 运行基准
+        run: cargo bench --no-default-features --bench parse || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: target/criterion/**/estimates.json
+          if-no-files-found: ignore
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
