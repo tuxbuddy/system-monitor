@@ -108,6 +108,18 @@ sudo scripts/uninstall-probe-helper.sh   # 卸载
 远端探针：在目标机的仓库里执行同一安装脚本；GUI/MCP 通过 `ssh <host>` 调用 helper 的
 `--one-shot` 代理（命令走 stdin/参数，不开放 TCP 端口），无需在远端额外部署服务端监听。
 
+目标机没有 Rust 工具链时，可交叉编译 x86_64 静态 helper（musl + 自带 rust-lld）：
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$(find "$(rustc --print sysroot)" -name rust-lld | head -1)" \
+  RUSTFLAGS="-C link-self-contained=yes" \
+  cargo build --release --target x86_64-unknown-linux-musl \
+  --bin probe-helper --no-default-features --features probe-helper
+```
+
+复制到目标机 `/usr/local/libexec/system-monitor/probe-helper`，用同一 systemd unit 启动即可。
+
 ## 配置
 
 | 文件 | 内容 |
